@@ -1,0 +1,90 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Certior",
+  "theme": "luma",
+  "colors": {
+    "primary": "#0F172A",
+    "light": "#3B82F6",
+    "dark": "#1E3A5F"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/paulinebourigault/certior"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "quickstart-openai"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/capability-model",
+              "concepts/policies",
+              "concepts/certificates"
+            ]
+          },
+          {
+            "group": "Framework Guides",
+            "pages": [
+              "guides/openai",
+              "guides/langchain",
+              "guides/crewai",
+              "guides/openclaw",
+              "guides/custom-loop"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/github-action",
+              "integrations/studio",
+              "integrations/skill-audit"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/configuration",
+              "reference/trust-package",
+              "reference/lean-binary"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/tasks",
+              "api/executions",
+              "api/workflows",
+              "api/compliance",
+              "api/releases"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

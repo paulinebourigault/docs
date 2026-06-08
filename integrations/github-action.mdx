@@ -1,0 +1,112 @@
+---
+title: "Run Certior Policy Checks on Pull Requests"
+sidebarTitle: "GitHub Action"
+description: "Gate every pull request with Lean-proven capability checks. The Certior GitHub Action fails the workflow when a delegation chain exceeds your policy."
+---
+
+The Certior GitHub Action runs your configured policy packages against every pull request, evaluating declared capability surfaces against permitted delegation boundaries before any code merges. When a delegation chain widens beyond what your policy allows, the action fails the workflow immediately — keeping non-compliant agent configurations out of your main branch without any manual review step.
+
+## Add the action to your workflow
+
+<Steps>
+  <Step title="Reference the action in your workflow file">
+    Create or update `.github/workflows/certior.yml` in your repository. The action is published at `paulinebourigault/certior/.github/actions/certior@main` and runs inside Docker — no additional setup is needed on your runner.
+
+    ```yaml
+    name: Certior Policy Check
+
+    on:
+      pull_request:
+        branches: [main]
+
+    jobs:
+      certior-check:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Certior policy check
+            uses: paulinebourigault/certior/.github/actions/certior@main
+            with:
+              policy_packages: "hipaa"
+    ```
+  </Step>
+
+  <Step title="Configure your policy packages">
+    Set `policy_packages` to the compliance policies you want enforced. Pass multiple packages as a comma-separated string:
+
+    ```yaml
+    with:
+      policy_packages: "hipaa, sox"
+    ```
+
+    Each package name maps to a Certior compliance preset. The action evaluates every policy in the list and fails if any one of them is violated.
+  </Step>
+
+  <Step title="(Optional) Wire the GitHub webhook for PR comments">
+    If you run a Certior server, you can have it post decision summaries back to each pull request as a comment. In your repository settings, add a webhook pointing to:
+
+    ```
+    POST https://<your-certior-host>/api/v1/releases/github-webhook
+    ```
+
+    The server receives pull request events, runs its verification graph traversal, and posts the resulting `SHIP` or `NO_SHIP` decision directly on the PR thread.
+  </Step>
+</Steps>
+
+## Input parameters
+
+<ParamField body="policy_packages" type="string" required>
+  Comma-separated list of policy packages to check. For example: `"hipaa"` or `"hipaa, sox"`. Each package name must match a Certior compliance preset. The action fails if any package in the list reports a violation.
+</ParamField>
+
+<ParamField body="repo_root" type="string" default=".">
+  The root directory of the repository to scan. Defaults to the repository root. Override this if your agent skill files live in a subdirectory.
+</ParamField>
+
+## Full workflow example
+
+The example below shows a complete workflow that checks against both `hipaa` and `sox` policies on every pull request targeting `main`:
+
+```yaml
+name: Certior Policy Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  certior-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Certior policy check
+        uses: paulinebourigault/certior/.github/actions/certior@main
+        with:
+          policy_packages: "hipaa, sox"
+          repo_root: "."
+```
+
+## What the action checks
+
+The action evaluates each declared capability surface in your repository against the configured policy packages. Specifically, it verifies that no delegation chain in the scanned code widens beyond the permissions the policy permits.
+
+The workflow step fails (`exit 1`) when:
+
+- A declared capability surface exceeds what the policy package allows
+- A delegation chain grants more permissions to a child agent than the parent holds
+- Any required policy evidence is missing or structurally invalid
+
+The step passes when all capability declarations are provably within the policy boundary for every configured package.
+
+<Note>
+  The action uses the same Lean 4-audited delegation rules as the runtime guard. The policy model it enforces has been machine-checked in CI — running the action does not introduce additional trust assumptions beyond Lean's three standard axioms.
+</Note>
+
+## PR comments from a live server
+
+When you connect a Certior server via the GitHub webhook, the server traverses its verification graph for the relevant commit and posts a structured decision comment on the pull request. The comment includes the release decision (`SHIP` or `NO_SHIP`), the policies evaluated, and a summary of any blocking violations. This is additive — the CI step still gates merges independently of whether the server webhook is configured.
+
+<Tip>
+  Start with `policy_packages: "hipaa"` to validate your setup, then add additional packages once the first check passes cleanly. This makes it easier to isolate which policy a new violation belongs to.
+</Tip>

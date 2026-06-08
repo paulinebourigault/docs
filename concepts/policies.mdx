@@ -1,0 +1,245 @@
+---
+title: "Compliance Policies: Content Safety and Audit Config"
+sidebarTitle: "Policies"
+description: "Certior ships four policies — default, hipaa, sox, and legal_privilege. Each tunes the Content gate with PII rules, keyword blocks, and audit settings."
+---
+
+A compliance policy in Certior is a named configuration that governs the Content gate — the second of the three gates that run before every tool call. While the Capability gate asks "is this agent allowed to call this tool at all?", the Content gate asks "does the content of this call violate domain-specific compliance rules?" A policy defines which content categories are blocked, which PII types are detected and auto-redacted, which keywords trigger a block, whether secrets detection is active, how long audit logs must be retained, and which tool actions require human approval before they can proceed.
+
+## The Four Built-in Policies
+
+Certior ships four ready-to-use compliance policies. You activate one by passing its name (or the `Policy` enum) to the `policy=` parameter of `Guard`.
+
+| Policy | Name | Key protections | Typical use cases |
+|---|---|---|---|
+| `"default"` | Default | Hate/bias/PII detection, threat and violence blocking | General-purpose agents, development, internal tooling |
+| `"hipaa"` | HIPAA | PHI blocking, PII auto-redact, secrets detection, 6-year audit retention, human approval for data export | Healthcare agents handling patient records, lab results, prescriptions |
+| `"sox"` | SOX | MNPI blocking, insider-information patterns, secrets detection, 7-year audit retention, human approval for financial record modification | Financial agents, auditing tools, earnings-analysis workflows |
+| `"legal_privilege"` | Legal Privilege | Attorney-client material blocking, privilege-waiver category, human approval for external communication | Legal-team agents, contract review, litigation support tools |
+
+## Default Policy
+
+The default policy activates hate/bias/PII detection, threat blocking, and violence blocking. PII is detected but not automatically redacted — it is flagged and recorded in `result.pii_found`.
+
+```python
+from certior import Guard
+
+# Default policy is used when you omit policy= entirely
+guard = Guard()
+
+# Or explicitly:
+guard = Guard(policy="default")
+
+result = guard.verify(
+    tool="summarize_text",
+    content="Call me at 555-867-5309 for more information.",
+)
+
+# PII (phone number) is flagged but not blocked under the default policy
+print(result.pii_found)     # [(PIIMatch(pii_type='PHONE_NUMBER', ...))]
+print(result.allowed)       # True — PII alone doesn't block under default
+```
+
+## HIPAA Policy
+
+The HIPAA policy is designed for agents that process protected health information. It blocks PHI categories and PII outright, auto-redacts detected PII from content and params, activates secrets detection, sets a 6-year audit retention requirement, and requires human approval for external communication, data export, and email tools.
+
+```python
+from certior import Guard, CertiorBlocked
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["database:read", "filesystem:read"],
+    budget_cents=5_000,
+)
+
+# PII is auto-redacted — the original content is NOT passed to the tool
+result = guard.verify(
+    tool="fetch_record",
+    content="Patient John Doe, SSN 123-45-6789, DOB 1980-01-15",
+    required_capabilities=["database:read"],
+    cost_cents=5,
+)
+
+print(result.allowed)
+# → True (PII is redacted, not blocked)
+
+print(result.redacted_content)
+# → "Patient [NAME], SSN [SSN], DOB [DATE_OF_BIRTH]"
+
+# Blocked keyword from HIPAA policy
+result2 = guard.verify(
+    tool="generate_note",
+    content="Recommended treatment plan: 10mg metformin daily",
+)
+
+print(result2.allowed)
+# → False
+print(result2.reason)
+# → "Blocked keyword: treatment plan"
+```
+
+<Note>
+  Under the HIPAA policy, the `requires_audit_trail` flag is set to `True`. Every `VerifyResult` with `result.certificate` populated provides the proof artifact you need to satisfy HIPAA's audit-trail requirements. See [Certificates](/concepts/certificates) for details.
+</Note>
+
+## SOX Policy
+
+The SOX policy protects against material non-public information (MNPI) leakage and insider-information exposure. It blocks MNPI and unauthorized-advice content categories, applies both keyword and regex-pattern matching (including `\bMNPI\b`, `\binsider\s+(?:information|trading)\b`, and `\bunreleased\s+earnings\b`), activates secrets detection, sets a 7-year audit retention requirement, and requires human approval for external communications and financial record modification.
+
+```python
+from certior import Guard, CertiorBlocked
+
+guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read"],
+    budget_cents=20_000,
+)
+
+# Blocked: MNPI keyword detected
+result = guard.verify(
+    tool="draft_report",
+    content="Unreleased earnings for Q3 are $2.4B, up 18% YoY.",
+)
+
+print(result.allowed)
+# → False
+print(result.violations[0].category)
+# → "mnpi_leak"
+print(result.violations[0].detail)
+# → "Blocked keyword: unreleased earnings"
+
+# Clean query — no MNPI content
+result2 = guard.verify(
+    tool="query_ledger",
+    params={"sql": "SELECT account_id, balance FROM accounts WHERE id = 42"},
+    required_capabilities=["database:read"],
+    cost_cents=10,
+)
+print(result2.allowed)
+# → True
+```
+
+## Legal Privilege Policy
+
+The legal privilege policy protects attorney-client communications from inadvertent disclosure. It blocks the `PRIVILEGE_WAIVER` content category, applies keyword detection for legal advice, attorney notes, case strategy, settlement terms, and witness preparation, and requires human approval before any email sending, external communication, or document sharing.
+
+```python
+from certior import Guard, CertiorBlocked
+
+guard = Guard(
+    policy="legal_privilege",
+    permissions=["filesystem:read", "network:http:read"],
+    budget_cents=10_000,
+)
+
+# Blocked: attorney-client keyword detected
+result = guard.verify(
+    tool="send_email",
+    content="Per our attorney-client discussion, the settlement terms are confidential.",
+)
+
+print(result.allowed)
+# → False
+print(result.violations[0].detail)
+# → "Blocked keyword: attorney-client"
+
+# Clean content passes
+result2 = guard.verify(
+    tool="read_contract",
+    content="This agreement is entered into as of January 1, 2024.",
+    required_capabilities=["filesystem:read"],
+    cost_cents=2,
+)
+print(result2.allowed)
+# → True
+```
+
+## Comparing All Four Policies
+
+<Tabs>
+  <Tab title="default">
+    ```python
+    guard = Guard(policy="default")
+    ```
+    **Blocked categories:** hate/bias/PII, threats, violence  
+    **PII handling:** detect only (no auto-redact)  
+    **Secrets detection:** off  
+    **Audit retention:** none specified  
+    **Human approval required:** none  
+  </Tab>
+  <Tab title="hipaa">
+    ```python
+    guard = Guard(policy="hipaa")
+    ```
+    **Blocked categories:** hate/bias/PII, PHI exposure  
+    **Blocked keywords:** `patient name`, `medical record`, `diagnosis`, `prescription`, `treatment plan`  
+    **PII handling:** detect + auto-redact  
+    **Secrets detection:** on  
+    **Audit retention:** 6 years  
+    **Human approval required:** `external_communication`, `data_export`, `send_email`  
+  </Tab>
+  <Tab title="sox">
+    ```python
+    guard = Guard(policy="sox")
+    ```
+    **Blocked categories:** MNPI leak, unauthorized advice  
+    **Blocked keywords:** `material non-public`, `insider`, `unreleased earnings`, `confidential projections`, `executive compensation`, `insider information`  
+    **Blocked patterns:** `\bMNPI\b`, `\binsider\s+(information|trading)\b`, `\bunreleased\s+earnings\b`  
+    **Secrets detection:** on  
+    **Audit retention:** 7 years  
+    **Human approval required:** `send_external_communication`, `modify_financial_records`  
+  </Tab>
+  <Tab title="legal_privilege">
+    ```python
+    guard = Guard(policy="legal_privilege")
+    ```
+    **Blocked categories:** privilege waiver  
+    **Blocked keywords:** `legal advice`, `attorney notes`, `case strategy`, `settlement terms`, `witness prep`, `settlement discussion`, `attorney-client`  
+    **PII handling:** none specified  
+    **Secrets detection:** off  
+    **Audit retention:** none specified  
+    **Human approval required:** `send_email`, `external_communication`, `document_sharing`  
+  </Tab>
+</Tabs>
+
+## Using the Policy Enum
+
+If you prefer type-safe code, import the `Policy` enum directly instead of passing a string:
+
+```python
+from certior import Guard, Policy
+
+guard = Guard(policy=Policy.HIPAA)
+guard = Guard(policy=Policy.SOX)
+guard = Guard(policy=Policy.LEGAL_PRIVILEGE)  # also available as Policy.LEGAL
+guard = Guard(policy=Policy.LEGAL)            # alias for Policy.LEGAL_PRIVILEGE
+guard = Guard(policy=Policy.DEFAULT)
+```
+
+You can also read back the active policy name at runtime:
+
+```python
+guard = Guard(policy="hipaa")
+print(guard.policy_name)
+# → "hipaa"
+```
+
+## Custom Policies
+
+For requirements that don't fit the four built-in presets, contact the Certior team to discuss a tailored compliance configuration. Custom policies let you specify additional blocked keywords, domain-specific PII patterns, extended retention periods, and approval gates beyond what the built-in presets cover.
+
+<Tip>
+  Custom policies are most useful when you need domain keywords that go beyond the built-in presets, or when you need to combine categories from multiple compliance frameworks — for example, a healthcare organization that also handles financial data and needs HIPAA-style PHI redaction alongside SOX-style MNPI blocking.
+</Tip>
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="How It Works" href="/concepts/how-it-works" icon="circle-info">
+    Understand where the Content gate fits within the full three-gate pipeline.
+  </Card>
+  <Card title="Certificates" href="/concepts/certificates" icon="certificate">
+    Learn how each allowed call generates a signed proof certificate for your audit trail.
+  </Card>
+</CardGroup>

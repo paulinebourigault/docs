@@ -1,0 +1,160 @@
+---
+title: "Quickstart: Add Certior to Your Agent in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install Certior, create a Guard, verify your first tool call, and read a signed certificate from the audit log — all in under five minutes."
+---
+
+This guide walks you through the fastest path to a working Certior integration. You'll install the package, create a `Guard`, see an allowed call produce a certificate, see a blocked call raise `CertiorBlocked`, use the `@guard.wrap()` decorator, and inspect the `audit_log`. No framework, no server, no live LLM key required.
+
+<Steps>
+  <Step title="Install Certior">
+    Certior requires Python 3.11 or later. Install it from PyPI:
+
+    ```bash
+    pip install certior
+    ```
+
+    This pulls in `z3-solver` and the Lean policy fingerprint metadata automatically. No system packages, no Docker, no extra steps.
+
+    <Note>
+      Certior is in **private beta**. If `pip install certior` returns a 404 or access error, email **hello@certior.io** to request access.
+    </Note>
+  </Step>
+
+  <Step title="Create a Guard">
+    Import `Guard` and declare the capability boundary for your agent. The `permissions` list is the set of capability strings the agent is allowed to use. `budget_cents` is the hard spending ceiling — the agent cannot exceed it no matter what the model asks.
+
+    ```python
+    from certior import Guard, CertiorBlocked
+
+    guard = Guard(
+        permissions=["network:http:read", "filesystem:read"],
+        budget_cents=5000,   # 50 USD ceiling
+        policy="default",    # capability + budget gates; see policy table below
+    )
+    ```
+
+    All three arguments are optional. `Guard()` with no arguments uses wildcard permissions, a 10 000-cent ceiling, and the `default` policy — useful for local experimentation, but you should always narrow the boundary before deploying.
+  </Step>
+
+  <Step title="Verify an allowed call">
+    Call `guard.verify()` before you execute any tool. Pass the tool name, its parameters, the capabilities it needs, and its cost.
+
+    ```python
+    result = guard.verify(
+        tool="web_fetch",
+        params={"url": "https://example.com"},
+        required_capabilities=["network:http:read"],
+        cost_cents=2,
+    )
+
+    print(result.allowed)       # True
+    print(result.latency_ms)    # typically < 10 ms
+    print(result.certificate)   # signed proof object — persist this for audit
+    ```
+
+    Because `"network:http:read"` is in the guard's `permissions` list and the cost is within budget, all three gates pass. Certior deducts 2 cents from the remaining budget and issues a signed certificate.
+  </Step>
+
+  <Step title="See a blocked call">
+    Now ask for a capability the guard was never given. Certior blocks the call and tells you exactly why.
+
+    ```python
+    result = guard.verify(
+        tool="db_admin_drop",
+        params={"table": "users"},
+        required_capabilities=["database:admin"],
+        cost_cents=0,
+    )
+
+    print(result.allowed)   # False
+    print(result.reason)    # "Capability 'database:admin' not in granted set"
+    print(result.blocked)   # True  (convenience property, == not result.allowed)
+    ```
+
+    The call never reaches your executor. The violation is recorded in `guard.audit_log`.
+  </Step>
+
+  <Step title="Use the decorator pattern">
+    For tools defined as regular functions, `@guard.wrap()` is the most concise integration. The decorator intercepts the call, runs verification, and either executes the function or raises `CertiorBlocked`.
+
+    ```python
+    @guard.wrap(required_capabilities=["network:http:read"], cost_cents=2)
+    def web_fetch(url: str) -> str:
+        import urllib.request
+        return urllib.request.urlopen(url).read().decode()
+
+    # Allowed — the function runs normally
+    html = web_fetch("https://example.com")
+
+    # Blocked — CertiorBlocked is raised before the function body executes
+    try:
+        web_fetch("https://example.com/admin")
+    except CertiorBlocked as e:
+        print(e.result.reason)
+    ```
+
+    `@guard.wrap` works on both synchronous and `async` functions. The wrapped function's signature and docstring are preserved via `functools.wraps`.
+  </Step>
+
+  <Step title="Inspect the audit log and certificates">
+    Every call — allowed or blocked — is recorded in `guard.audit_log`. Each allowed call that passed Z3 verification also carries a `certificate` you can persist for compliance purposes.
+
+    ```python
+    # Audit log: lightweight summary of every call
+    for entry in guard.audit_log:
+        print(
+            entry["tool"],       # tool name
+            entry["allowed"],    # True / False
+            entry["violations"], # count of violations found
+            entry["latency_ms"], # wall-clock verification time
+        )
+
+    # Certificate: full signed proof object (on the VerifyResult)
+    result = guard.verify(
+        tool="read_file",
+        params={"path": "/reports/q4.pdf"},
+        required_capabilities=["filesystem:read"],
+        cost_cents=1,
+    )
+
+    if result.allowed:
+        cert = result.certificate
+        print(cert)   # includes Lean policy fingerprint, Z3 trace, signature
+    ```
+
+    <Tip>
+      Store the certificate alongside the tool output in your data pipeline. An auditor can take the `policy_fingerprint` field from any certificate and independently re-verify the proof against the published Lean policy source.
+    </Tip>
+  </Step>
+</Steps>
+
+## Remaining budget
+
+You can check how much of the budget your agent has left at any point:
+
+```python
+print(guard.budget_remaining)   # starts at budget_cents, decremented on each allowed call
+```
+
+## Policy options
+
+The `policy` parameter controls what the Content gate looks for. Capability and Budget gates run regardless of the policy you choose.
+
+| Policy | What the Content gate adds | Use for |
+|---|---|---|
+| `"default"` | No content scanning | Most agents, development, testing |
+| `"hipaa"` | PHI detection and redaction, 6-year audit retention | Healthcare, research with patient data |
+| `"sox"` | MNPI detection, 7-year retention, segregation of duties | Trading, finance, M&A workflows |
+| `"legal_privilege"` | Attorney-client privilege protection | Legal review, contract drafting |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="OpenAI Guide" icon="wand-magic-sparkles" href="/quickstart-openai">
+    Drop `verify_tool_calls()` into your existing OpenAI tool-calling loop and handle allowed and blocked calls with a clean if/else.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for `Guard`, `VerifyResult`, `VerifyResult.certificate`, `CertiorBlocked`, and all framework adapters.
+  </Card>
+</CardGroup>

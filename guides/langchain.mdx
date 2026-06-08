@@ -1,0 +1,236 @@
+---
+title: "Certior Safety Verification for LangChain Agents and Chains"
+sidebarTitle: "LangChain"
+description: "Attach CertiorCallbackHandler to any LangChain agent or chain to verify every tool call before execution and scan every output for sensitive data."
+---
+
+Certior integrates with LangChain through its callback system. You attach a `CertiorCallbackHandler` to any agent, chain, or tool invocation and Certior intercepts every `on_tool_start` event before LangChain executes the tool. If the call is blocked the handler raises `CertiorBlocked`, which LangChain surfaces to the LLM as a tool error — your agent loop never calls the underlying tool implementation. On `on_tool_end`, the handler also scans the output for PII or policy violations before the result returns to the agent.
+
+## Install
+
+```bash
+pip install certior langchain-core
+```
+
+The LangChain adapter requires `langchain-core`. If it isn't installed, `CertiorCallbackHandler` raises an `ImportError` immediately on construction rather than silently failing at call time.
+
+## Basic setup
+
+```python
+from certior import Guard
+from certior.adapters.langchain import CertiorCallbackHandler
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+)
+handler = CertiorCallbackHandler(guard)
+```
+
+You can also construct a handler without pre-building a `Guard` — it will create one from the `policy` argument:
+
+```python
+handler = CertiorCallbackHandler(policy="sox", block_on_violation=True)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `guard` | `Guard` | `None` | Pre-configured guard instance. Takes precedence over `policy`. |
+| `policy` | `str` | `"default"` | Compliance preset to use when `guard` is not supplied. |
+| `block_on_violation` | `bool` | `True` | Whether to raise `CertiorBlocked` from the callback hook. See note below. |
+
+## Attaching to an agent
+
+Pass the handler in the `callbacks` key of the `config` argument to `agent.invoke()`. This is the narrowest scope — the handler applies only to that single invocation:
+
+```python
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_openai import ChatOpenAI
+from langchain.tools import tool
+
+@tool
+def search_web(query: str) -> str:
+    """Search the web for recent information."""
+    return fetch_results(query)
+
+@tool
+def read_patient_record(record_id: str) -> str:
+    """Retrieve a patient record from the database."""
+    return db.get(record_id)
+
+llm   = ChatOpenAI(model="gpt-4o")
+agent = AgentExecutor(
+    agent=create_openai_tools_agent(llm, [search_web, read_patient_record], prompt),
+    tools=[search_web, read_patient_record],
+)
+
+guard   = Guard(policy="hipaa", permissions=["network:http:read", "database:read"])
+handler = CertiorCallbackHandler(guard)
+
+result = agent.invoke(
+    {"input": "Look up the latest research on MRSA treatment."},
+    config={"callbacks": [handler]},
+)
+```
+
+## What happens on each hook
+
+<Accordion title="on_tool_start — input verification">
+
+`on_tool_start` fires before LangChain calls the tool function. The handler calls `guard.verify()` with the tool name, the serialised input string, and any extra `inputs` dict from kwargs:
+
+```python
+def on_tool_start(
+    self,
+    serialized: Dict[str, Any],
+    input_str: str,
+    **kwargs: Any,
+) -> None:
+    tool_name = serialized.get("name", "unknown")
+
+    result = self.guard.verify(
+        tool=tool_name,
+        content=input_str,
+        params=kwargs.get("inputs", {}),
+    )
+
+    if result.blocked and self.block_on_violation:
+        raise CertiorBlocked(result)
+```
+
+A `CertiorBlocked` exception here means LangChain records a tool error and passes it back to the LLM — the tool function itself is never invoked.
+
+</Accordion>
+
+<Accordion title="on_tool_end — output scanning">
+
+`on_tool_end` fires after the tool returns. The handler scans the output string for PII leakage and policy violations:
+
+```python
+def on_tool_end(self, output: str, **kwargs: Any) -> None:
+    result = self.guard.verify(content=output)
+    if result.blocked and self.block_on_violation:
+        raise CertiorBlocked(result)
+```
+
+This catches data-exfiltration scenarios where the tool itself returned sensitive content (e.g. a database record containing an SSN). Under `policy="hipaa"` the scanner detects and redacts PHI even if the capability check passed.
+
+</Accordion>
+
+## Attaching globally
+
+To apply Certior verification to every chain run in a process, append the handler to LangChain's global callbacks list:
+
+```python
+import langchain
+
+guard   = Guard(policy="default", permissions=["network:http:read"])
+handler = CertiorCallbackHandler(guard)
+
+langchain.callbacks.append(handler)
+# All subsequent agent.invoke() and chain.run() calls now go through Certior
+```
+
+<Warning>
+Global callbacks apply to **all** chains in the process, including internal chains LangChain uses for routing and formatting. If you have multiple agents with different capability sets, construct separate `Guard` instances and attach per-agent handlers via the `config` argument instead.
+</Warning>
+
+## Handling blocked calls
+
+When `block_on_violation=True` and a call is blocked, LangChain receives the `CertiorBlocked` exception as a tool error. You can catch it explicitly in your orchestration layer if you need custom logging or fallback behaviour:
+
+```python
+from certior import CertiorBlocked
+
+try:
+    result = agent.invoke(
+        {"input": user_query},
+        config={"callbacks": [handler]},
+    )
+except CertiorBlocked as e:
+    print(f"Call blocked: {e.result.reason}")
+    print(f"Violations:   {[v.detail for v in e.result.violations]}")
+    print(f"PII found:    {e.result.pii_found}")
+    # Return a safe fallback or re-raise to the caller
+```
+
+If you prefer a softer integration — where violations are logged but the call is not stopped — set `block_on_violation=False`. Blocked verdicts will still appear in `guard.audit_log` and fire `on_violation` callbacks, but LangChain continues executing the tool:
+
+```python
+handler = CertiorCallbackHandler(guard, block_on_violation=False)
+```
+
+<Note>
+`block_on_violation=False` is useful during a phased rollout where you want to measure the rate of would-be blocks before turning enforcement on. Do not use it in production healthcare or financial workflows — `block_on_violation=True` is the correct setting whenever you need real enforcement.
+</Note>
+
+## Auditing tool calls
+
+Every `guard.verify()` call — whether from `on_tool_start` or `on_tool_end` — writes an entry to `guard.audit_log`. You can inspect it after any agent run:
+
+```python
+result = agent.invoke({"input": query}, config={"callbacks": [handler]})
+
+for entry in handler.guard.audit_log:
+    print(entry)
+# {"tool": "search_web", "allowed": True,  "violations": 0, "pii_count": 0, "latency_ms": 3.1, "time": ...}
+# {"tool": "read_patient_record", "allowed": False, "violations": 1, "pii_count": 0, "latency_ms": 2.8, "time": ...}
+```
+
+<Tip>
+For HIPAA-regulated workflows, pair the in-memory audit log with a durable append-only store (e.g. write each entry to S3 or a Postgres table). The 6-year retention requirement starts from the time of the tool call, not the time of the audit export.
+</Tip>
+
+## Complete example
+
+```python
+from certior import Guard, CertiorBlocked
+from certior.adapters.langchain import CertiorCallbackHandler
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_openai import ChatOpenAI
+from langchain.tools import tool
+from langchain import hub
+
+# ── Tools ────────────────────────────────────────────────────────────
+@tool
+def search_web(query: str) -> str:
+    """Search the web for recent information."""
+    return f"[results for {query!r}]"
+
+@tool
+def read_patient_record(record_id: str) -> str:
+    """Retrieve a patient record from the EHR system."""
+    return f"[record {record_id}]"
+
+# ── Guard (HIPAA preset, two capabilities) ───────────────────────────
+guard = Guard(
+    policy="hipaa",
+    permissions=["network:http:read", "database:read"],
+    budget_cents=2000,
+    agent_id="clinical-assistant",
+)
+handler = CertiorCallbackHandler(guard, block_on_violation=True)
+
+# ── Agent ─────────────────────────────────────────────────────────────
+llm   = ChatOpenAI(model="gpt-4o")
+tools = [search_web, read_patient_record]
+agent = AgentExecutor(
+    agent=create_openai_tools_agent(llm, tools, hub.pull("hwchase17/openai-tools-agent")),
+    tools=tools,
+)
+
+# ── Run with Certior verification ─────────────────────────────────────
+try:
+    result = agent.invoke(
+        {"input": "Find the latest treatment guidelines for Type 2 diabetes."},
+        config={"callbacks": [handler]},
+    )
+    print(result["output"])
+except CertiorBlocked as e:
+    print(f"Blocked: {e.result.reason}")
+
+# ── Audit ─────────────────────────────────────────────────────────────
+print(f"Remaining budget: {guard.budget_remaining}¢")
+print(f"Audit entries:    {len(guard.audit_log)}")
+```

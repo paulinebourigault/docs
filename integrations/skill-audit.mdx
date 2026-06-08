@@ -1,0 +1,215 @@
+---
+title: "Audit OpenClaw Skills Before They Run"
+sidebarTitle: "Skill Audit"
+description: "Use certior-skill-audit to prove a skill's declared capability surface fits inside the parent guard's permissions before the skill enters your pipeline."
+---
+
+`certior-skill-audit` is a pre-install and pre-load auditor for OpenClaw skills. Given a `SKILL.md` file and a parent `Guard`'s permission set, it deductively proves that every capability the skill declares is a subset of what the parent holds — before the skill is wired into any pipeline. If the subset relation does not hold, the audit exits non-zero, making it straightforward to integrate into pre-install hooks, CI workflows, or release pipelines.
+
+## Install
+
+`certior-skill-audit` ships with the `certior` pip package — no separate install is needed:
+
+```bash
+pip install certior
+certior-skill-audit --help
+```
+
+The auditor does not require `openclaw-sdk` to be installed. All three checks are purely static, operating only on the `SKILL.md` file.
+
+## The three checks
+
+The auditor runs three deductive checks in order. A skill passes only when all three pass.
+
+<Steps>
+  <Step title="Declaration present">
+    The skill must declare `metadata.certior.capabilities` in its `SKILL.md` frontmatter. A skill with no declaration fails the audit by default (fail-closed). Pass `--allow-undeclared` to skip this check for skills that have not yet adopted the Certior extension field.
+  </Step>
+  <Step title="Capability subset">
+    Every capability listed in `metadata.certior.capabilities` must appear in the parent guard's `--permission` list. A parent permission of `*` satisfies every capability. Any capability that is declared but missing from the parent list causes the audit to fail with `capability_not_in_parent`.
+  </Step>
+  <Step title="Fingerprint pin (optional)">
+    When you supply `--expected-fingerprint <skill-name>=<sha256>`, the audit fails if the current SHA-256 of the `SKILL.md` file does not match the expected value. Use this to detect unexpected changes to a skill file you have already reviewed.
+  </Step>
+</Steps>
+
+## The SKILL.md extension field
+
+OpenClaw's native `SKILL.md` schema does not include a capability field. Certior adds an opt-in extension under `metadata.certior`. Add it to any skill you want to audit:
+
+```yaml
+---
+name: research
+description: Search public AI safety research and summarise findings
+homepage: https://example.com/research-skill
+metadata:
+  openclaw:
+    requires:
+      env: ["TAVILY_API_KEY"]
+  certior:
+    capabilities:
+      - "network:http:read"
+---
+
+When the user asks for AI research, use the `web_search` tool…
+```
+
+The extension is opt-in by design. Certior does not infer capabilities from `metadata.requires.bins` because a skill that declares no binaries can still issue HTTP calls or read files — inference would create a false sense of security.
+
+<Warning>
+  Skills without a `metadata.certior.capabilities` block fail the audit unless you explicitly pass `--allow-undeclared`. This fail-closed default is intentional: an undeclared capability surface cannot be subset-checked.
+</Warning>
+
+## Usage
+
+### Audit a single skill
+
+```bash
+certior-skill-audit ./my-skill/SKILL.md \
+    --permission network:http:read \
+    --permission filesystem:read
+```
+
+Example output:
+
+```
+[PASS] research  (/home/.../my-skill/SKILL.md)
+       declared: ['network:http:read']
+       parent:   ['network:http:read', 'filesystem:read']
+       fp:       27d2a906e6eebb80…  (no pin)
+
+Audited 1 skill(s): 1 pass, 0 fail
+```
+
+### Audit a whole skills directory
+
+Pass the skills directory to audit every `SKILL.md` found inside it. This mirrors OpenClaw's `~/.openclaw/workspace/skills/<skill>/SKILL.md` layout:
+
+```bash
+certior-skill-audit ~/.openclaw/workspace/skills \
+    --permission network:http:read \
+    --permission filesystem:read
+```
+
+Example output with a failing skill:
+
+```
+[PASS] research  (/.../research/SKILL.md)
+       declared: ['network:http:read']
+       parent:   ['network:http:read', 'filesystem:read']
+       fp:       27d2a906e6eebb80…  (no pin)
+[FAIL] exfiltrator  (/.../exfiltrator/SKILL.md)
+       declared: ['database:admin']
+       parent:   ['network:http:read', 'filesystem:read']
+       missing:  ['database:admin']
+       reason:   capability_not_in_parent: database:admin
+
+Audited 2 skill(s): 1 pass, 1 fail
+```
+
+### Pin a known-good version
+
+After reviewing a skill, capture its fingerprint and pin it. The audit then fails if the file is modified:
+
+```bash
+# Get the fingerprint for a reviewed skill
+certior-skill-audit ./research/SKILL.md \
+    --permission network:http:read \
+    --json \
+    | jq -r '.[0].fingerprint'
+# → 27d2a906e6eebb80…
+
+# Run with the pin — fails if the file has changed since review
+certior-skill-audit ~/.openclaw/workspace/skills \
+    --permission network:http:read \
+    --expected-fingerprint research=27d2a906e6eebb80…
+```
+
+A changed file produces: `fingerprint_mismatch: expected …, got …`
+
+### Machine-readable output
+
+Add `--json` to get a JSON array you can pipe into other tools:
+
+```bash
+certior-skill-audit ~/.openclaw/workspace/skills \
+    --permission network:http:read \
+    --json
+```
+
+Each result object includes: `skill_path`, `skill_name`, `passed`, `declared_capabilities`, `parent_permissions`, `missing_capabilities`, `fingerprint`, `expected_fingerprint`, `fingerprint_matches`, and `reasons`.
+
+## CLI flags reference
+
+<Accordion title="--permission">
+  **Type:** string (repeatable)
+
+  Add a capability to the parent guard's permission list. Repeat the flag for multiple permissions. For example: `--permission network:http:read --permission filesystem:read`. Pass `*` to satisfy every possible capability declaration.
+</Accordion>
+
+<Accordion title="--allow-undeclared">
+  **Type:** flag
+
+  Skip the declaration-present check for skills that have no `metadata.certior.capabilities` block. By default, undeclared skills fail the audit. Use this flag when auditing a mixed skills directory that has not yet been fully annotated.
+</Accordion>
+
+<Accordion title="--expected-fingerprint">
+  **Type:** `<name>=<sha256>` (repeatable)
+
+  Pin a specific skill to a known-good SHA-256 fingerprint of its `SKILL.md` file. Fails the audit if the file's current fingerprint does not match. Repeat for multiple skills. Fingerprints are available in the `--json` output under the `fingerprint` key.
+</Accordion>
+
+<Accordion title="--json">
+  **Type:** flag
+
+  Emit a JSON array instead of human-readable output. Each element corresponds to one audited skill. Useful for piping results into release automation, dashboards, or test harnesses.
+</Accordion>
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All audited skills passed |
+| `1` | One or more skills failed the audit |
+| `2` | Usage error (invalid arguments) |
+
+## Python library API
+
+The same checks are available as Python functions for use inside a release pipeline or test harness:
+
+```python
+from certior import Guard
+from certior.adapters.openclaw import (
+    audit_skill,
+    audit_skills_dir,
+    skill_fingerprint,
+)
+
+parent = Guard(permissions=["network:http:read", "filesystem:read"], budget_cents=0)
+
+# Audit a single skill
+result = audit_skill("./research/SKILL.md", parent)
+assert result.passed, result.reasons
+
+# Audit a whole directory with fingerprint pins
+pins = {"research": "27d2a906e6eebb80…"}
+results = audit_skills_dir(
+    "~/.openclaw/workspace/skills",
+    parent,
+    expected_fingerprints=pins,
+)
+for r in results:
+    print(r.skill_name, r.passed, r.reasons)
+```
+
+## Scope and non-goals
+
+`certior-skill-audit` is intentionally narrow. It gives you a **deductive** check that a skill's declared capability surface fits inside the parent guard's permissions. It does not:
+
+- **Scan skill source code for dangerous patterns.** Tools such as [ClawGuard](https://github.com/NY1024/ClawGuard) do that — they are complementary, not redundant. Run both if you want both dimensions of assurance.
+- **Verify intent.** Whether the skill's implementation matches its description is an LLM-judgement problem, not amenable to formal proof.
+- **Detect supply-chain compromise.** A `SKILL.md` with correct capability declarations can still pull a malicious dependency. Pair the audit with your host runtime's sandbox for defence in depth.
+
+<Tip>
+  The soundness of the subset rule the auditor enforces is established by Lean's `delegationSafety` theorem. The audit runs that rule statically against a skill so delegation safety can be assessed before the first call — the same rule that re-runs at request time inside `GuardedAgent` and `GuardedPipeline`.
+</Tip>

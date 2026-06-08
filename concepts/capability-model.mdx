@@ -1,0 +1,232 @@
+---
+title: "Capability Model: Permissions, Scope, and Delegation"
+sidebarTitle: "Capabilities"
+description: "Capabilities are permission strings like 'network:http:read' that bound what an agent can do. Learn to grant, scope, and delegate them across agent chains."
+---
+
+Capabilities are the foundation of Certior's safety model. A capability is a colon-separated permission string — like `"network:http:read"` or `"filesystem:read"` — that names a specific operation an agent is allowed to perform. Every `Guard` holds a set of capabilities. Every wrapped tool declares which capabilities it requires. Before any tool call executes, Certior's Capability gate formally verifies that the tool's requirements are a strict subset of the guard's granted permissions. If even one required capability is absent, the call is blocked before any other work happens.
+
+## Capability String Format
+
+Capabilities follow a hierarchical `domain:resource:action` pattern. The colon-separated segments let you express broad or narrow grants depending on how much trust you want to extend.
+
+```
+network:http:read       # read-only HTTP requests
+network:http:write      # HTTP POST/PUT/DELETE
+network:*               # all network operations (wildcard)
+filesystem:read         # read files
+filesystem:write        # write files
+filesystem:*            # all filesystem operations
+database:read          # run database queries
+database:*              # all database operations
+*                       # unrestricted (no capability gate run)
+```
+
+<Note>
+  The wildcard `"*"` grants full access and skips the Z3 capability gate entirely — no certificate is issued for wildcard-permission guards. Use explicit capability strings whenever you need audit trails or are operating under a compliance policy.
+</Note>
+
+Real capability strings from the Certior quickstart:
+
+```python
+from certior import Guard, CertiorBlocked
+
+# Grant only read access to HTTP — no writes, no filesystem
+guard = Guard(permissions=["network:http:read"])
+
+@guard.wrap(required_capabilities=["network:http:read"])
+def web_fetch(url: str): ...
+
+# This call is allowed — "network:http:read" ∈ guard.permissions
+web_fetch("https://example.com")
+
+# This call is blocked — "network:http:write" ∉ guard.permissions
+@guard.wrap(required_capabilities=["network:http:write"])
+def post_data(url: str, body: str): ...
+
+try:
+    post_data("https://api.example.com/submit", body="{}")
+except CertiorBlocked as e:
+    print(e.result.reason)
+    # → "Capability 'network:http:write' not in agent permissions"
+```
+
+## Setting Capabilities on a Guard
+
+You pass capabilities as a list of strings to the `permissions=` parameter of `Guard`:
+
+```python
+from certior import Guard
+
+# Single capability
+guard = Guard(permissions=["filesystem:read"])
+
+# Multiple capabilities
+guard = Guard(
+    permissions=["filesystem:read", "database:read", "network:http:read"],
+    policy="hipaa",
+    budget_cents=10_000,
+)
+
+# Read the active capability set at any time
+print(guard.permissions)
+# → ["filesystem:read", "database:read", "network:http:read"]
+```
+
+A `Guard`'s capability set is cryptographically signed and structurally frozen after construction. Attempting to mutate `permissions` after the guard is created raises `AttributeError` — this prevents privilege escalation through in-place mutation.
+
+## How Wildcard Matching Works
+
+When Certior evaluates `has_permission(perm)` against your guard's capability set, it checks two rules:
+
+1. **Exact match** — `"network:http:read"` grants `"network:http:read"` exactly.
+2. **Wildcard prefix** — `"network:*"` grants any permission that starts with `"network:"`, such as `"network:http:read"`, `"network:http:write"`, or `"network:websocket:read"`.
+
+```python
+guard = Guard(permissions=["network:*"])
+
+@guard.wrap(required_capabilities=["network:http:read"])
+def fetch(url): ...
+
+@guard.wrap(required_capabilities=["network:websocket:read"])
+def stream(ws_url): ...
+
+# Both allowed — "network:*" covers all "network:" prefixed capabilities
+fetch("https://example.com")
+stream("wss://events.example.com")
+```
+
+## Delegation: Capabilities Flow Downward Only
+
+When one agent spawns a child agent or delegates a subtask, Certior enforces the **subset rule**: a child guard can hold *at most* the capabilities its parent holds. It can never gain permissions the parent does not have.
+
+This property — called attenuation safety — is proven as a Lean 4 theorem (`Certior.Delegation.delegationSafety`). It holds at every depth of a delegation chain. Grandchild permissions are always a subset of parent permissions, which are always a subset of grandparent permissions, and so on.
+
+```python
+from certior import Guard, CertiorBlocked
+
+# Parent agent: broad access
+parent_guard = Guard(
+    permissions=["filesystem:read", "network:http:read", "database:read"],
+    budget_cents=10_000,
+)
+
+# Child agent: subset of parent's capabilities
+child_guard = Guard(
+    permissions=["filesystem:read"],   # only filesystem — network and database NOT delegated
+    budget_cents=2_000,                # child cannot exceed parent's remaining budget
+)
+
+# Tool that requires a capability the child does NOT hold
+@child_guard.wrap(required_capabilities=["network:http:read"])
+def child_web_fetch(url: str): ...
+
+try:
+    child_web_fetch("https://example.com")
+except CertiorBlocked as e:
+    print(e.result.violations[0].category)
+    # → "capability"
+    print(e.result.violations[0].detail)
+    # → "Capability 'network:http:read' not in agent permissions"
+```
+
+<Warning>
+  There is no runtime call to "link" a child guard to its parent — the subset constraint is enforced structurally at each guard's verification step. If you construct a child guard with a capability the parent does not hold, blocked calls will surface at the child's gate on the first tool call that requires that permission.
+</Warning>
+
+## What Happens If a Required Capability Is Missing
+
+When a tool call reaches the Capability gate and the required capabilities are not a subset of the guard's permissions, the gate:
+
+<Steps>
+  <Step title="Invokes Z3">
+    The Z3 verifier computes whether `required_capabilities ⊆ available_capabilities`. If not, it returns one or more violation strings naming each missing capability.
+  </Step>
+  <Step title="Creates a Violation record">
+    Each missing capability becomes a `Violation(category="capability", detail="...", severity="block")` in `VerifyResult.violations`.
+  </Step>
+  <Step title="Blocks without consuming budget">
+    The call is blocked immediately. No budget is deducted, no certificate is issued, and the Content and Budget gates are not evaluated.
+  </Step>
+  <Step title="Raises CertiorBlocked (wrap) or returns VerifyResult (verify)">
+    If you used `guard.wrap`, `CertiorBlocked` is raised with the full result attached. If you called `guard.verify` directly, `result.allowed` is `False` and `result.reason` contains a semicolon-joined summary of all violation details.
+  </Step>
+</Steps>
+
+## Capability Examples by Use Case
+
+<Accordion title="Healthcare agent (HIPAA)">
+```python
+# A medical-records agent that can only read structured data
+hipaa_guard = Guard(
+    policy="hipaa",
+    permissions=["database:read", "filesystem:read"],
+    budget_cents=5_000,
+)
+
+@hipaa_guard.wrap(
+    required_capabilities=["database:read"],
+    cost_cents=5,
+)
+def fetch_patient_record(patient_id: str) -> dict:
+    ...
+
+@hipaa_guard.wrap(
+    required_capabilities=["filesystem:read"],
+    cost_cents=2,
+)
+def read_lab_report(path: str) -> str:
+    ...
+```
+</Accordion>
+
+<Accordion title="Financial agent (SOX)">
+```python
+# An auditing agent: read-only access to financial data, no writes
+sox_guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read"],
+    budget_cents=20_000,
+)
+
+@sox_guard.wrap(
+    required_capabilities=["database:read"],
+    cost_cents=10,
+)
+def query_ledger(sql: str) -> list:
+    ...
+```
+</Accordion>
+
+<Accordion title="Multi-tool orchestrator">
+```python
+# Orchestrator with broad permissions delegates narrower subsets
+orchestrator = Guard(
+    permissions=["filesystem:read", "filesystem:write", "network:http:read", "database:*"],
+    budget_cents=50_000,
+)
+
+# File-only sub-agent
+file_agent = Guard(
+    permissions=["filesystem:read", "filesystem:write"],
+    budget_cents=5_000,
+)
+
+# Network-only sub-agent
+network_agent = Guard(
+    permissions=["network:http:read"],
+    budget_cents=5_000,
+)
+```
+</Accordion>
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="How It Works" href="/concepts/how-it-works" icon="circle-info">
+    See how the Capability gate fits into the full three-gate pipeline.
+  </Card>
+  <Card title="Policies" href="/concepts/policies" icon="file-shield">
+    Content policies add domain-specific keyword and PII rules on top of capability checks.
+  </Card>
+</CardGroup>

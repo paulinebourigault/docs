@@ -1,0 +1,236 @@
+---
+title: "Certior Executions API — Status, Results & Cancellation"
+sidebarTitle: "Executions"
+description: "Retrieve status, verification results, and proof certificates for a task execution, list all executions for your account, or cancel a queued job."
+---
+
+After you submit a task via `POST /api/v1/tasks`, Certior runs it asynchronously and tracks every state transition in an execution record. You can poll the execution by ID, list all executions for your account with optional status filtering, or cancel a job that hasn't started yet. The execution record is the authoritative source for agent output, proof certificates, and the per-step verification summary.
+
+## GET /api/v1/executions/{id}
+
+Retrieve the full execution record including status, agent output, verification summary, and proof certificate IDs.
+
+**Requires authentication.** Returns `200 OK`.
+
+### Path Parameters
+
+<ParamField path="execution_id" type="string" required>
+  The UUID of the execution returned by `POST /api/v1/tasks`.
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="id" type="string">
+  The execution UUID.
+</ResponseField>
+
+<ResponseField name="user_id" type="string">
+  The UUID of the user who submitted the task.
+</ResponseField>
+
+<ResponseField name="task" type="string">
+  The original task description.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current lifecycle status. One of: `queued`, `planning`, `executing`, `verifying`, `completed`, `failed`, `cancelled`.
+</ResponseField>
+
+<ResponseField name="compliance_policy" type="string">
+  The compliance preset that was applied, for example `"hipaa"` or `"default"`.
+</ResponseField>
+
+<ResponseField name="current_step" type="integer">
+  Index of the step currently being executed (0-based). Useful for progress display.
+</ResponseField>
+
+<ResponseField name="output" type="string">
+  The agent's final output text. Present only when `status` is `"completed"`.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error message if `status` is `"failed"`. Empty string otherwise.
+</ResponseField>
+
+<ResponseField name="cost_cents" type="integer">
+  Total cost of the execution in US cents, updated as the run progresses.
+</ResponseField>
+
+<ResponseField name="llm_provider" type="string">
+  The LLM provider used for this execution, for example `"openai"` or `"anthropic"`.
+</ResponseField>
+
+<ResponseField name="llm_model" type="string">
+  The model used for this execution, for example `"gpt-4o"`.
+</ResponseField>
+
+<ResponseField name="certificate_count" type="integer">
+  Total number of proof certificates issued for this execution.
+</ResponseField>
+
+<ResponseField name="certificate_ids" type="array of strings">
+  Ordered list of certificate IDs emitted during the verified execution. Use these IDs to retrieve full certificate data from the compliance export.
+</ResponseField>
+
+<ResponseField name="proof_properties" type="array of strings">
+  Deduplicated list of all verified properties across all certificates, for example `["information_flow: proven", "capability_coverage: proven", "budget_sufficient: proven"]`.
+</ResponseField>
+
+<ResponseField name="verification_profile" type="object">
+  The task-adaptive verification profile that was applied, showing required proofs, permission ceiling, stage role, and upstream dependencies.
+</ResponseField>
+
+<ResponseField name="verification_summary" type="object">
+  Present when the execution has a results payload.
+
+  <Expandable title="verification_summary fields">
+    <ResponseField name="steps" type="integer">
+      Number of tool-call steps executed.
+    </ResponseField>
+
+    <ResponseField name="duration_ms" type="number">
+      Total wall-clock time of the execution in milliseconds.
+    </ResponseField>
+
+    <ResponseField name="total_input_tokens" type="integer">
+      Cumulative input tokens consumed across all LLM calls.
+    </ResponseField>
+
+    <ResponseField name="total_output_tokens" type="integer">
+      Cumulative output tokens generated across all LLM calls.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="created_at" type="number">
+  Unix timestamp (seconds) when the execution was created.
+</ResponseField>
+
+<ResponseField name="updated_at" type="number">
+  Unix timestamp of the most recent state update.
+</ResponseField>
+
+<ResponseField name="completed_at" type="number">
+  Unix timestamp when the execution reached a terminal state. `null` if still running.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://<host>/api/v1/executions/9d7e4f2a-1c3b-4e5a-8f6d-0a1b2c3d4e5f \
+  -H "Authorization: Bearer ck-your-key"
+```
+
+```json
+{
+  "id": "9d7e4f2a-1c3b-4e5a-8f6d-0a1b2c3d4e5f",
+  "user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "task": "Summarize a patient encounter into a discharge summary. Redact all direct identifiers.",
+  "status": "completed",
+  "compliance_policy": "hipaa",
+  "current_step": 3,
+  "output": "DISCHARGE SUMMARY\n[redacted]...",
+  "error": "",
+  "cost_cents": 142,
+  "llm_provider": "openai",
+  "llm_model": "gpt-4o",
+  "certificate_count": 3,
+  "certificate_ids": [
+    "cert-a1b2c3d4",
+    "cert-e5f6g7h8",
+    "lean-9d7e4f2a"
+  ],
+  "proof_properties": [
+    "information_flow: proven",
+    "capability_coverage: proven",
+    "budget_sufficient: proven"
+  ],
+  "verification_profile": {
+    "task_class": "clinical_intake",
+    "stage_role": "intake",
+    "required_proofs": ["no_phi_external_flow", "minimum_necessary_access", "authorized_user_only"]
+  },
+  "verification_summary": {
+    "steps": 3,
+    "duration_ms": 4812.5,
+    "total_input_tokens": 2104,
+    "total_output_tokens": 638
+  },
+  "created_at": 1718000000.0,
+  "updated_at": 1718000005.0,
+  "completed_at": 1718000005.0
+}
+```
+
+---
+
+## GET /api/v1/executions
+
+List executions for the authenticated user, newest first.
+
+**Requires authentication.** Returns `200 OK` with a JSON array.
+
+### Query Parameters
+
+<ParamField query="status" type="string">
+  Filter by execution status. Accepted values: `queued`, `planning`, `executing`, `verifying`, `completed`, `failed`, `cancelled`.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of results to return. Minimum `1`, maximum `100`.
+</ParamField>
+
+```bash
+curl "https://<host>/api/v1/executions?status=completed&limit=5" \
+  -H "Authorization: Bearer ck-your-key"
+```
+
+---
+
+## DELETE /api/v1/executions/{id}
+
+Cancel a queued or planning execution before it starts running.
+
+**Requires authentication.** Returns `200 OK` on success, `409 Conflict` if the execution is already running or completed.
+
+### Path Parameters
+
+<ParamField path="execution_id" type="string" required>
+  The UUID of the execution to cancel.
+</ParamField>
+
+```bash
+curl -X DELETE https://<host>/api/v1/executions/9d7e4f2a-... \
+  -H "Authorization: Bearer ck-your-key"
+```
+
+```json
+{
+  "execution_id": "9d7e4f2a-1c3b-4e5a-8f6d-0a1b2c3d4e5f",
+  "status": "cancelled"
+}
+```
+
+<Note>
+You can only cancel executions that belong to your user account. If the execution has already entered `executing` or `verifying` state, it cannot be cancelled and the API returns `409 Conflict`.
+</Note>
+
+---
+
+## Execution Status Lifecycle
+
+```
+queued → planning → executing → verifying → completed
+                                          ↘ failed
+  queued → cancelled (if cancelled before executing)
+```
+
+| Status | Description |
+|--------|-------------|
+| `queued` | Accepted and waiting in the task queue |
+| `planning` | Agent is producing a step-by-step execution plan |
+| `executing` | Agent is calling tools; verification gates are active |
+| `verifying` | Final verification pass running before completion |
+| `completed` | Execution finished successfully; output and certificates available |
+| `failed` | Execution ended with an error; see `error` field |
+| `cancelled` | Execution was cancelled before it could run to completion |

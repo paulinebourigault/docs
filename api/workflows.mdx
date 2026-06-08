@@ -1,0 +1,389 @@
+---
+title: "Certior Workflows API — Multi-Stage Orchestration"
+sidebarTitle: "Workflows"
+description: "Create sequential multi-stage workflows where Certior enforces a policy per stage, auto-chains execution IDs, and records per-stage proof evidence."
+---
+
+Workflows let Certior own the orchestration of a sequential, policy-heavy pipeline. You define a list of stages — each with its own task, compliance preset, budget, and role — and Certior executes them in order, enforcing verification gates at each stage, passing upstream execution IDs forward automatically, and recording per-stage proof certificates in a single workflow object. When you're done, one `GET /api/v1/workflows/{id}/export` call returns the complete multi-stage audit package as a downloadable JSON file.
+
+## When to Use Workflows vs Direct Tasks
+
+Use workflows when:
+- The flow is sequential and each stage must observe formal constraints before the next can start.
+- You want Certior Studio operators to run and inspect the pipeline directly.
+- You need a single object with unified per-stage audit evidence.
+
+Keep orchestration outside Certior and use individual `POST /api/v1/tasks` calls when:
+- Your application already has a coordinator with non-sequential branching, retries, or dynamic fan-out.
+- You're embedding Certior as a verified execution gateway inside a larger system that manages its own control flow.
+
+---
+
+## POST /api/v1/workflows
+
+Create and immediately start a multi-stage workflow. Certior executes all stages sequentially and stops on the first failure.
+
+**Requires authentication. Users with `viewer` role cannot create workflows.** Returns `201 Created`.
+
+### Request Body
+
+<ParamField body="name" type="string" required>
+  Human-readable name for the workflow. Maximum 160 characters.
+</ParamField>
+
+<ParamField body="description" type="string">
+  Optional description for display in Certior Studio. Maximum 400 characters.
+</ParamField>
+
+<ParamField body="stages" type="array of objects" required>
+  Ordered list of stage definitions. Minimum 1, maximum 12 stages. Each stage executes a separate verified task.
+
+  <Expandable title="Stage fields">
+    <ParamField body="id" type="string">
+      Optional stable identifier for this stage. Used to reference the stage in `upstream_stage_ids` of later stages. Certior assigns a UUID if omitted.
+    </ParamField>
+
+    <ParamField body="name" type="string" required>
+      Display name for this stage. Maximum 120 characters.
+    </ParamField>
+
+    <ParamField body="task" type="string" required>
+      Natural-language task description for the agent at this stage.
+    </ParamField>
+
+    <ParamField body="compliance_policy" type="string" default="default">
+      Compliance preset for this stage: `hipaa`, `sox`, `legal_privilege`, or `default`. Each stage can use a different policy.
+    </ParamField>
+
+    <ParamField body="budget_cents" type="integer" default="1500">
+      Spend budget for this stage in US cents. Minimum `100`, maximum `1,000,000`.
+    </ParamField>
+
+    <ParamField body="stage_role" type="string" default="worker">
+      Role of this stage in the pipeline. Examples: `intake`, `reviewer`, `release`, `worker`. `release`-role stages require at least one prior stage to have completed, enforcing the review-before-release constraint.
+    </ParamField>
+
+    <ParamField body="provider" type="string">
+      LLM provider override for this stage: `anthropic` or `openai`.
+    </ParamField>
+
+    <ParamField body="model" type="string">
+      Model override for this stage, e.g. `"gpt-4o"`.
+    </ParamField>
+
+    <ParamField body="api_key" type="string">
+      Per-stage provider API key. Used only for this stage; not persisted to the execution record.
+    </ParamField>
+
+    <ParamField body="permissions" type="array of strings">
+      Permissions to request for this stage. Intersected with the stage's compliance policy ceiling.
+    </ParamField>
+
+    <ParamField body="upstream_stage_ids" type="array of strings">
+      Stage IDs that must complete before this stage can run. When omitted, Certior automatically chains the previous stage's execution ID.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="id" type="string">
+  The workflow UUID.
+</ResponseField>
+
+<ResponseField name="user_id" type="string">
+  The UUID of the owning user.
+</ResponseField>
+
+<ResponseField name="user_role" type="string">
+  The role of the user who created the workflow.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  The workflow name.
+</ResponseField>
+
+<ResponseField name="description" type="string">
+  The workflow description.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Overall workflow status: `pending`, `running`, `completed`, `failed`, `cancelled`.
+</ResponseField>
+
+<ResponseField name="mode" type="string">
+  Execution mode for this workflow.
+</ResponseField>
+
+<ResponseField name="current_stage_index" type="integer">
+  Zero-based index of the stage currently executing.
+</ResponseField>
+
+<ResponseField name="stage_count" type="integer">
+  Total number of stages in the workflow.
+</ResponseField>
+
+<ResponseField name="completed_stage_count" type="integer">
+  Number of stages that have reached `completed` status.
+</ResponseField>
+
+<ResponseField name="stages" type="array of objects">
+  Full stage records including status, execution ID, timestamps, and output summaries.
+
+  <Expandable title="Stage response fields">
+    <ResponseField name="id" type="string">
+      The stage UUID.
+    </ResponseField>
+
+    <ResponseField name="name" type="string">
+      The stage name.
+    </ResponseField>
+
+    <ResponseField name="task" type="string">
+      The stage's task description.
+    </ResponseField>
+
+    <ResponseField name="compliance_policy" type="string">
+      The compliance preset applied to this stage.
+    </ResponseField>
+
+    <ResponseField name="budget_cents" type="integer">
+      The spend budget for this stage.
+    </ResponseField>
+
+    <ResponseField name="stage_role" type="string">
+      The stage's role in the pipeline.
+    </ResponseField>
+
+    <ResponseField name="provider" type="string">
+      LLM provider used for this stage, if specified.
+    </ResponseField>
+
+    <ResponseField name="model" type="string">
+      Model used for this stage, if specified.
+    </ResponseField>
+
+    <ResponseField name="permissions" type="array of strings">
+      Permissions requested for this stage.
+    </ResponseField>
+
+    <ResponseField name="upstream_stage_ids" type="array of strings">
+      Stage IDs this stage depends on.
+    </ResponseField>
+
+    <ResponseField name="status" type="string">
+      Stage status: `pending`, `running`, `completed`, `failed`, `cancelled`.
+    </ResponseField>
+
+    <ResponseField name="execution_id" type="string">
+      UUID of the execution created for this stage. Use with `GET /api/v1/executions/{id}` or the compliance export endpoint.
+    </ResponseField>
+
+    <ResponseField name="started_at" type="number">
+      Unix timestamp when the stage started.
+    </ResponseField>
+
+    <ResponseField name="completed_at" type="number">
+      Unix timestamp when the stage completed.
+    </ResponseField>
+
+    <ResponseField name="output_summary" type="string">
+      First 180 characters of the stage's agent output.
+    </ResponseField>
+
+    <ResponseField name="error" type="string">
+      Error message if the stage failed. Empty string otherwise.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="created_at" type="number">
+  Unix timestamp of workflow creation.
+</ResponseField>
+
+<ResponseField name="updated_at" type="number">
+  Unix timestamp of the last state update.
+</ResponseField>
+
+<ResponseField name="completed_at" type="number">
+  Unix timestamp when the workflow reached a terminal state. `null` if still running.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Top-level error message if the workflow failed.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash Create a HIPAA clinical review pipeline
+curl -X POST https://<host>/api/v1/workflows \
+  -H "Authorization: Bearer ck-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "HIPAA Clinical Review Pipeline",
+    "description": "Intake and privacy-review for a patient encounter note.",
+    "stages": [
+      {
+        "id": "intake",
+        "name": "Clinical Intake",
+        "task": "Summarize the patient encounter note. Redact all direct identifiers. Apply minimum-necessary principle.",
+        "compliance_policy": "hipaa",
+        "budget_cents": 2000,
+        "stage_role": "intake",
+        "provider": "openai",
+        "model": "gpt-4o"
+      },
+      {
+        "id": "privacy-review",
+        "name": "Privacy Reviewer",
+        "task": "Review the intake summary for residual PHI, privilege leakage, and minimum-necessary compliance. Return a structured GO/NO-GO.",
+        "compliance_policy": "legal_privilege",
+        "budget_cents": 1200,
+        "stage_role": "reviewer",
+        "upstream_stage_ids": ["intake"],
+        "provider": "openai",
+        "model": "gpt-4o"
+      }
+    ]
+  }'
+```
+
+```json Response (201)
+{
+  "id": "wf-3a4b5c6d-7e8f-...",
+  "user_id": "f47ac10b-...",
+  "user_role": "operator",
+  "name": "HIPAA Clinical Review Pipeline",
+  "description": "Intake and privacy-review for a patient encounter note.",
+  "status": "running",
+  "mode": "agentic",
+  "current_stage_index": 0,
+  "stage_count": 2,
+  "completed_stage_count": 0,
+  "stages": [
+    {
+      "id": "intake",
+      "name": "Clinical Intake",
+      "task": "Summarize the patient encounter note...",
+      "compliance_policy": "hipaa",
+      "budget_cents": 2000,
+      "stage_role": "intake",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "permissions": [],
+      "upstream_stage_ids": [],
+      "status": "running",
+      "execution_id": null,
+      "started_at": 1718000001.0,
+      "completed_at": null,
+      "output_summary": null,
+      "error": ""
+    },
+    {
+      "id": "privacy-review",
+      "name": "Privacy Reviewer",
+      "task": "Review the intake summary for residual PHI...",
+      "compliance_policy": "legal_privilege",
+      "budget_cents": 1200,
+      "stage_role": "reviewer",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "permissions": [],
+      "upstream_stage_ids": ["intake"],
+      "status": "pending",
+      "execution_id": null,
+      "started_at": null,
+      "completed_at": null,
+      "output_summary": null,
+      "error": ""
+    }
+  ],
+  "created_at": 1718000000.0,
+  "updated_at": 1718000001.0,
+  "completed_at": null,
+  "error": ""
+}
+```
+</CodeGroup>
+
+---
+
+## GET /api/v1/workflows
+
+List workflows for the authenticated user, newest first.
+
+**Requires authentication.** Returns `200 OK` with a JSON array.
+
+### Query Parameters
+
+<ParamField query="status" type="string">
+  Filter by workflow status: `pending`, `running`, `completed`, `failed`, `cancelled`.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of results. Minimum `1`, maximum `100`.
+</ParamField>
+
+---
+
+## GET /api/v1/workflows/{id}
+
+Retrieve the current state of a single workflow, including per-stage status and execution IDs.
+
+**Requires authentication.** Returns `200 OK`. Returns `404` if the workflow doesn't exist or belongs to a different user.
+
+### Path Parameters
+
+<ParamField path="workflow_id" type="string" required>
+  The UUID of the workflow.
+</ParamField>
+
+---
+
+## DELETE /api/v1/workflows/{id}
+
+Cancel a running workflow. All pending and running stages are moved to `cancelled`. Stages that have already completed are not affected.
+
+**Requires authentication.** Returns `200 OK` on success, `409 Conflict` if the workflow has already reached a terminal state (`completed`, `failed`, or `cancelled`).
+
+```json
+{
+  "workflow_id": "wf-3a4b5c6d-...",
+  "status": "cancelled"
+}
+```
+
+---
+
+## GET /api/v1/workflows/{id}/export
+
+Export the complete multi-stage audit package as a downloadable JSON file (`Content-Disposition: attachment`). The package includes the workflow record, each stage's execution payload, and the full compliance package for every completed stage.
+
+**Requires authentication.** Returns `200 OK`.
+
+<ResponseField name="workflow" type="object">
+  The full workflow record (same structure as `GET /api/v1/workflows/{id}`).
+</ResponseField>
+
+<ResponseField name="exported_at" type="number">
+  Unix timestamp of when this export was generated.
+</ResponseField>
+
+<ResponseField name="stages" type="array of objects">
+  Per-stage export records.
+
+  <Expandable title="Stage export fields">
+    <ResponseField name="stage" type="object">
+      The stage record with status, execution ID, and output summary.
+    </ResponseField>
+
+    <ResponseField name="execution" type="object">
+      The full execution record for this stage, if available.
+    </ResponseField>
+
+    <ResponseField name="compliance_package" type="object">
+      The full compliance audit package for this stage's execution, if the stage completed successfully.
+    </ResponseField>
+  </Expandable>
+</ResponseField>

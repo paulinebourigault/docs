@@ -1,0 +1,249 @@
+---
+title: "Certior Safety Gates for CrewAI Tools and Multi-Agent Crews"
+sidebarTitle: "CrewAI"
+description: "Wrap individual CrewAI tools or guard an entire crew with Certior's capability, content, and budget gates — choose the pattern that fits your workflow."
+---
+
+Certior provides two integration patterns for CrewAI: a decorator that wraps a single tool function, and a helper that rewires every tool across all agents in a crew at once. Both patterns run the same three-gate verification (capability, content, budget) before the underlying tool function executes. A blocked verdict returns a `[CERTIOR BLOCKED]` string to the agent rather than raising an exception, so the LLM can reason about the refusal and try an alternative approach.
+
+## Install
+
+```bash
+pip install certior crewai
+```
+
+## Pattern 1: certior_tool_wrapper — wrap a single tool
+
+Use `certior_tool_wrapper` when you want fine-grained control over which tools are guarded and with what policy. Apply it as a decorator directly underneath CrewAI's `@tool` decorator:
+
+```python
+from certior import Guard
+from certior.adapters.crewai import certior_tool_wrapper
+from crewai.tools import tool
+
+guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read"],
+    budget_cents=3000,
+)
+
+@tool("financial_query")
+@certior_tool_wrapper(guard, tool_name="financial_query")
+def query_financials(query: str) -> str:
+    """Run a read-only financial database query."""
+    return db.execute(query)
+
+@tool("market_data")
+@certior_tool_wrapper(guard, tool_name="market_data")
+def fetch_market_data(symbol: str) -> str:
+    """Fetch current market data for a symbol."""
+    return market_api.get(symbol)
+```
+
+`certior_tool_wrapper` parameters:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `guard` | `Guard` | `None` | Pre-configured guard. If omitted, a `Guard(policy=policy)` is created. |
+| `policy` | `str` | `"default"` | Compliance preset used when `guard` is not supplied. |
+| `tool_name` | `str` | `""` | Override name used in the audit log and capability check. Defaults to the function's `__name__`. |
+
+### What the wrapper does
+
+The wrapper extracts the first string argument (or first string keyword argument) from the call as the content for the PII and safety scanner. It then calls `guard.verify()` with the tool name, content, and full kwargs:
+
+```python
+result = _guard.verify(
+    tool=name,
+    content=content,   # first string arg, used for PII scanning
+    params=kwargs if kwargs else None,
+)
+if result.blocked:
+    return f"[CERTIOR BLOCKED] {result.reason}"
+
+return fn(*args, **kwargs)  # only reached if all three gates pass
+```
+
+A blocked call returns a string that your CrewAI agent sees as the tool output. The LLM can decide to try a different tool or report the failure to the user.
+
+## Pattern 2: guard_crew_tools — guard an entire crew
+
+Use `guard_crew_tools` when you want to apply one policy to every tool across all agents in a crew without modifying each tool definition individually. Call it after constructing the crew and before calling `kickoff()`:
+
+```python
+from certior import Guard
+from certior.adapters.crewai import guard_crew_tools
+from crewai import Agent, Crew, Task
+from crewai.tools import tool
+
+# ── Define tools ──────────────────────────────────────────────────────
+@tool("web_search")
+def web_search(query: str) -> str:
+    """Search the web for recent information."""
+    return fetch_results(query)
+
+@tool("file_reader")
+def file_reader(path: str) -> str:
+    """Read a local file and return its contents."""
+    return open(path).read()
+
+# ── Build agents ──────────────────────────────────────────────────────
+researcher = Agent(
+    role="Research Analyst",
+    goal="Find relevant information on a given topic",
+    tools=[web_search],
+)
+writer = Agent(
+    role="Content Writer",
+    goal="Summarise research findings into a clear report",
+    tools=[file_reader],
+)
+
+# ── Build crew ────────────────────────────────────────────────────────
+crew = Crew(
+    agents=[researcher, writer],
+    tasks=[
+        Task(description="Research recent AI safety developments", agent=researcher),
+        Task(description="Write a one-page summary", agent=writer),
+    ],
+)
+
+# ── Apply Certior to all tools in one call ────────────────────────────
+guard = Guard(
+    policy="default",
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+)
+guard_crew_tools(crew, guard)   # modifies crew in-place, returns crew for chaining
+
+result = crew.kickoff()
+```
+
+`guard_crew_tools` iterates over `crew.agents`, and for each agent iterates over `agent.tools`. For any tool that has a `.func` callable, it rewraps `tool.func` with `certior_tool_wrapper`. The crew object is modified in-place and returned for optional chaining.
+
+<Note>
+`guard_crew_tools` wraps `tool.func` — the raw Python function behind each CrewAI tool object. If a tool has already been wrapped by another decorator that hides `.func`, `guard_crew_tools` skips it silently. In that case use `certior_tool_wrapper` directly on the function definition instead.
+</Note>
+
+## Choosing the right pattern
+
+<CardGroup cols={2}>
+  <Card title="certior_tool_wrapper" icon="screwdriver-wrench">
+    **Use when:**
+    - Different tools need different policies or permission sets
+    - You want per-tool `tool_name` labels in the audit log
+    - You're adding Certior to existing tools incrementally
+    - You need one tool guarded by a SOX policy and another by HIPAA
+  </Card>
+  <Card title="guard_crew_tools" icon="users">
+    **Use when:**
+    - All tools in the crew share the same policy
+    - You're retrofitting Certior onto an existing crew without touching tool definitions
+    - You want the simplest possible integration path
+    - You're in a regulated industry and need a single audit boundary for the whole crew
+  </Card>
+</CardGroup>
+
+## Financial workflows with the SOX policy
+
+For trading, finance, and M&A workflows, use `policy="sox"`. The SOX preset adds MNPI (material non-public information) detection, a 7-year audit retention flag on every certificate, and segregation-of-duties checks.
+
+```python
+from certior import Guard
+from certior.adapters.crewai import certior_tool_wrapper, guard_crew_tools
+from crewai.tools import tool
+
+sox_guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read"],
+    budget_cents=10_000,
+    agent_id="financial-analyst-crew",
+)
+
+@tool("earnings_query")
+@certior_tool_wrapper(sox_guard, tool_name="earnings_query")
+def query_earnings(ticker: str, quarter: str) -> str:
+    """Query earnings data for a given ticker and quarter."""
+    return financials_db.get_earnings(ticker, quarter)
+
+@tool("trade_history")
+@certior_tool_wrapper(sox_guard, tool_name="trade_history")
+def get_trade_history(account_id: str) -> str:
+    """Retrieve trade history for an account."""
+    return trading_api.history(account_id)
+```
+
+<Warning>
+Under `policy="sox"`, any payload containing detected MNPI is blocked and the blocked verdict is recorded with a 7-year retention flag. Do not set `block_on_violation=False` in financial workflows — the enforcement block is part of the compliance posture, not just an advisory.
+</Warning>
+
+## Reading blocked verdicts in the crew output
+
+When `certior_tool_wrapper` blocks a call, the agent sees a string like:
+
+```
+[CERTIOR BLOCKED] capability: tool 'db_admin_drop' requires ['database:admin'],
+agent holds ['database:read', 'network:http:read']
+```
+
+Your crew's final output will contain this string if the last task relied on the blocked tool. You can post-process the output to detect blocked calls:
+
+```python
+result = crew.kickoff()
+
+if "[CERTIOR BLOCKED]" in str(result):
+    print("One or more tool calls were blocked during this run.")
+    print("Audit log:", sox_guard.audit_log)
+```
+
+## Complete example
+
+```python
+from certior import Guard
+from certior.adapters.crewai import certior_tool_wrapper, guard_crew_tools
+from crewai import Agent, Crew, Task
+from crewai.tools import tool
+
+# ── Guard ──────────────────────────────────────────────────────────────
+guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read", "filesystem:read"],
+    budget_cents=8000,
+    agent_id="financial-research-crew",
+)
+
+# ── Tools (individual wrapping) ────────────────────────────────────────
+@tool("market_search")
+@certior_tool_wrapper(guard, tool_name="market_search")
+def market_search(query: str) -> str:
+    """Search for market-related information."""
+    return search_api(query)
+
+@tool("sec_filing_reader")
+@certior_tool_wrapper(guard, tool_name="sec_filing_reader")
+def read_sec_filing(ticker: str) -> str:
+    """Retrieve the latest SEC filing for a company."""
+    return sec_api.get_latest(ticker)
+
+# ── Agents and crew ────────────────────────────────────────────────────
+analyst = Agent(
+    role="Financial Analyst",
+    goal="Research a company's financial health",
+    tools=[market_search, sec_filing_reader],
+)
+
+crew = Crew(
+    agents=[analyst],
+    tasks=[Task(description="Analyse ACME Corp's Q3 financials", agent=analyst)],
+)
+
+# ── Run ────────────────────────────────────────────────────────────────
+output = crew.kickoff()
+print(output)
+
+# ── Audit summary ─────────────────────────────────────────────────────
+allowed = sum(1 for e in guard.audit_log if e["allowed"])
+blocked = sum(1 for e in guard.audit_log if not e["allowed"])
+print(f"\nCertior: {allowed} calls allowed, {blocked} blocked")
+print(f"Budget remaining: {guard.budget_remaining}¢")
+```

@@ -1,0 +1,101 @@
+---
+title: "Certior Trust Package and Assurance Model"
+sidebarTitle: "Trust Package"
+description: "What Certior formally proves, what it does not claim to prove, and how runtime evidence binds to proof claims in the certificate pipeline."
+---
+
+Certior is a formally verified agent orchestration platform. This page is the canonical statement of its assurance model — what it proves mathematically, where those proofs stop, how runtime evidence ties to verified claims, how release decisions are formed, and what you as an operator must guarantee for the model to hold. Read this before presenting Certior attestations to auditors, compliance teams, or customers.
+
+## What Certior proves
+
+When Certior executes an agentic action or issues a release decision, it proves the following properties hold mathematically:
+
+<CardGroup cols={1}>
+  <Card title="Capability Containment" icon="shield-check">
+    An agent can never execute an operation that exceeds the cryptographic capabilities granted to it prior to execution. Every tool call is checked against a capability token before it runs. The rule that governs this check — that child capabilities must form a subset of the parent — is proven sound in Lean 4 (`Certior.Delegation.delegationSafety`) and enforced per-call by Z3.
+  </Card>
+  <Card title="Compliance Ceilings" icon="scale-balanced">
+    Domain-specific constraints — HIPAA data isolation, SOX non-repudiation, SOC 2 change management rules — are checked universally. The policy boundaries are encoded in a Lean 4 mathematical lattice (`SecurityLevel.isValidBoundedLattice`) and enforced at runtime by a Z3 dependency solver. A call that would cross a compliance ceiling is provably blocked, not warned about.
+  </Card>
+  <Card title="Lineage and Provenance" icon="link">
+    Every piece of runtime evidence is deterministically bound to a specific code commit SHA, the policy version active at that commit, and the cryptographic runtime state at the time of execution. You can always trace a signed certificate back to the exact code and policy that produced it.
+  </Card>
+</CardGroup>
+
+## What Certior does not prove
+
+Certior is explicit about its boundaries. The following properties are **outside** the formal assurance model:
+
+<Warning>
+  Understanding these boundaries is essential before relying on Certior attestations in a regulated context.
+</Warning>
+
+**LLM output correctness.** Certior cannot mathematically prove that an LLM's natural language output is correct or helpful. It proves only that the LLM's *actions* remain within permitted structural bounds. The content of an LLM response is not formally verified.
+
+**Upstream data integrity.** If an external system — a CI runner, a webhook source, an API endpoint — provides false data about a commit or execution, Certior records that data truthfully in the verification graph. Certior relies on cryptographic signatures within the pipeline to establish trust in upstream nodes; it does not independently verify the honesty of those systems.
+
+**Zero-day sandboxing.** Certior enforces policy statically and dynamically, but the underlying transport container must be secured by standard DevSecOps practices — gVisor, seccomp profiles, and least-privilege process isolation. Certior's formal guarantees assume the execution environment itself is not compromised.
+
+## How runtime evidence binds to proof claims
+
+For evidence to enter the verification graph, the following certificate pipeline executes:
+
+<Steps>
+  <Step title="Claim creation">
+    A runtime worker produces a claim — for example, the result of a capability check, a content scan, or a budget deduction.
+  </Step>
+  <Step title="Attestation">
+    The claim is enriched with a `CertiorCapabilityToken` that captures the agent's execution bounds at the time the claim was made.
+  </Step>
+  <Step title="Graph binding">
+    The payload is hashed and linked as a strictly directed edge from the relevant code commit SHA. No claim can be inserted that is not anchored to a specific commit.
+  </Step>
+  <Step title="Export validation">
+    When you export a compliance audit package (`GET /api/v1/compliance/{id}/export`), the exporter extracts the relevant subgraph and re-verifies the capability lattice using Lean 4 before generating the PDF or JSON evidence record. The export is not a snapshot — it is a re-verified proof.
+  </Step>
+</Steps>
+
+Every signed certificate embeds the fingerprint of the Lean-audited policy model at the time of signing (`policy_attestation.fingerprint`). An auditor can independently verify the certificate by:
+
+1. Matching the fingerprint against `lean4/CertiorLattice/Certior/*.lean`
+2. Running `cd lean4/CertiorLattice && lake build Certior.Audit`
+3. Confirming the four audited guarantees depend only on Lean's three standard axioms
+
+## Release decisions
+
+Certior's release decision is purely deterministic — there is no human judgment involved in computing it.
+
+`GET /api/v1/releases/decision` traverses the verification graph and evaluates it against all active compliance policies for the repository. The algorithm:
+
+1. Collects every active compliance policy for the repository
+2. Evaluates the presence and freshness of all required runtime evidence — SAST scans, functional tests, peer review sign-offs, and any policy-specific requirements
+3. Checks that all proofs are structurally valid and their certificates are current
+
+<CardGroup cols={2}>
+  <Card title="SHIP / PROMOTABLE" icon="circle-check" color="#22c55e">
+    All proofs are structurally valid, signed, and fresh. All required evidence is present. A human approver can lock this decision via `POST /api/v1/releases/promote`.
+  </Card>
+  <Card title="NO_SHIP / BLOCKED" icon="circle-xmark" color="#ef4444">
+    Any single policy fails, any required evidence is missing, or any evidence is stale. The decision is universally blocked — partial compliance does not produce a qualified SHIP.
+  </Card>
+</CardGroup>
+
+<Note>
+  The release decision is all-or-nothing. If any policy fails or any evidence is missing, the result is `NO_SHIP` — not a graded score. This is a deliberate design choice: a compliance ceiling either holds or it does not.
+</Note>
+
+## Operational assumptions
+
+For the assurance model to hold in your deployment, you must satisfy the following:
+
+<Accordion title="Verification graph integrity">
+  The verification graph that backs Certior's proof claims must not be directly mutated outside of Certior's own write paths. Certior's proofs bind evidence to specific graph edges; external mutations break those bindings and invalidate the certificates that depend on them. Use a dedicated least-privilege database role for Certior and restrict direct access accordingly.
+</Accordion>
+
+<Accordion title="Identity immutability">
+  Credentials assigned to approvers must map strictly to single human identities. The release approval model relies on clear separation between approver, auditor, and policy-author roles. Shared credentials or role conflation break the non-repudiation guarantees that Certior's SOX and audit-trail policies depend on.
+</Accordion>
+
+<Accordion title="Key rotation">
+  LLM API keys must be injected through your platform's secrets management system — Vault, Kubernetes Secrets, or equivalent — rather than hardcoded in configuration files. Hardcoded keys allow direct agent usage outside the verified execution loop, bypassing the capability and policy checks entirely.
+</Accordion>

@@ -1,0 +1,264 @@
+---
+title: "Certificates: Tamper-Evident Proof of Every Tool Call"
+sidebarTitle: "Certificates"
+description: "Every allowed call produces a signed certificate with a Lean policy fingerprint and Z3 proof trace. Learn to store and verify them for compliance audits."
+---
+
+When Certior allows a tool call, it doesn't just let execution proceed — it issues a signed certificate that records exactly why the call was permitted. Each certificate is a JSON-serializable object that binds the specific action (tool name, required capabilities, cost, and agent ID) to the Lean policy fingerprint active at that moment, the Z3 proof trace that evaluated the call, and a SHA-256 signature over all identity fields. This certificate is your tamper-evident receipt: any modification to the action, the policy, or the properties causes the signature to fail validation. An auditor can reproduce the full proof independently using a single command.
+
+## What a Certificate Contains
+
+Every `VerifiedCertificate` carries the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `str` | UUID uniquely identifying this certificate in Certior's tamper-evident audit registry |
+| `theorem` | `str` | Name of the proved theorem, e.g. `"action_admissible:web_fetch"` |
+| `plan_hash` | `str` | `sha256:` prefixed hash of the action representation (tool, capabilities, cost, agent, policy fingerprint) — binds the certificate to exactly this call |
+| `verified_properties` | `list[str]` | Machine-readable list of properties Z3 verified, plus the Lean policy attestation tag |
+| `proof_trace` | `str` | Human-readable summary of the Z3 solve, e.g. `"Z3 SAT in 4.2ms, policy: Lean-audited @ a3f8c1b2d4e57091"` |
+| `prover` | `str` | The prover that issued the certificate (`"z3"`) |
+| `issued_at` | `float` | Unix timestamp when the certificate was issued |
+| `expires_at` | `float \| None` | Unix timestamp when the certificate expires (default: 1 hour after issuance) |
+
+The `plan_hash` is computed by hashing a canonical JSON representation of the action:
+
+```python
+action_repr = json.dumps({
+    "tool": tool,
+    "requires": sorted(required_capabilities),
+    "cost_cents": cost_cents,
+    "agent": agent_id,
+    "policy_fingerprint": lean_fingerprint,
+}, sort_keys=True)
+
+plan_hash = "sha256:" + hashlib.sha256(action_repr.encode()).hexdigest()
+```
+
+This means the certificate is provably bound to one specific action at one specific policy revision. Changing the tool name, adding a capability, adjusting the cost, or updating the Lean source — any of these produces a different `plan_hash`.
+
+## When Certificates Are Issued
+
+<Note>
+  Certificates are only issued when the Capability gate runs a real Z3 verification. If your guard uses `permissions=["*"]` (wildcard), no Z3 gate is invoked and `result.certificate` will be `None`. Use explicit capability strings whenever you need audit-trail certificates.
+</Note>
+
+A certificate is issued when:
+1. The `Guard` has explicit (non-wildcard) permissions.
+2. You pass `required_capabilities=` and/or `cost_cents=` to `guard.verify()` or `guard.wrap()`.
+3. All three gates — Capability, Content, and Budget — pass.
+
+A certificate is **not** issued on blocked calls or on wildcard-permission guards by design. You only sign what has been formally proven.
+
+## Accessing Certificates
+
+### Via `VerifyResult.certificate`
+
+When you call `guard.verify()` directly, the certificate is attached to the returned `VerifyResult`:
+
+```python
+from certior import Guard
+import json
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["database:read"],
+    budget_cents=5_000,
+)
+
+result = guard.verify(
+    tool="fetch_patient_record",
+    params={"record_id": "P-4821"},
+    required_capabilities=["database:read"],
+    cost_cents=5,
+)
+
+if result.allowed and result.certificate:
+    cert = result.certificate
+    print(cert.id)                   # e.g. "3f8a1b2c-..."
+    print(cert.theorem)              # "action_admissible:fetch_patient_record"
+    print(cert.plan_hash)            # "sha256:abc123..."
+    print(cert.proof_trace)          # "Z3 SAT in 3.8ms, policy: Lean-audited @ a3f8c1b2d4e57091"
+    print(cert.verified_properties)
+    # ["capability_coverage", "budget_sufficient", "policy_model:lean-audited@a3f8c1b2d4e57091"]
+
+    # Serialize to JSON for storage
+    cert_json = json.dumps(cert.to_dict(), indent=2)
+```
+
+### Via `guard.audit_log`
+
+The audit log records a summary of every call — allowed or blocked — including latency, PII count, and whether a certificate was issued:
+
+```python
+# After several tool calls:
+for entry in guard.audit_log:
+    print(entry)
+# {
+#   "tool": "fetch_patient_record",
+#   "allowed": True,
+#   "violations": 0,
+#   "pii_count": 0,
+#   "latency_ms": 12.4,
+#   "time": 1721000000.0,
+# }
+```
+
+<Note>
+  `guard.audit_log` returns a snapshot (copy) of the internal log — it is safe to iterate without risk of concurrent modification.
+</Note>
+
+## Storing Certificates for Compliance
+
+For HIPAA, SOX, and similar frameworks, you should persist certificates alongside your tool outputs. Here is a pattern for storing them to a structured log:
+
+```python
+from certior import Guard
+import json
+import time
+
+guard = Guard(
+    policy="sox",
+    permissions=["database:read", "network:http:read"],
+    budget_cents=20_000,
+    agent_id="auditing-agent-v2",
+)
+
+certificate_store = []   # replace with your database / SIEM / object store
+
+def run_verified_tool(tool_name: str, fn, required_caps, cost, **kwargs):
+    result = guard.verify(
+        tool=tool_name,
+        params=kwargs,
+        required_capabilities=required_caps,
+        cost_cents=cost,
+    )
+
+    if result.blocked:
+        raise ValueError(f"Tool call blocked: {result.reason}")
+
+    # Persist the certificate immediately
+    if result.certificate:
+        certificate_store.append({
+            "cert_id":     result.certificate.id,
+            "theorem":     result.certificate.theorem,
+            "plan_hash":   result.certificate.plan_hash,
+            "properties":  result.certificate.verified_properties,
+            "proof_trace": result.certificate.proof_trace,
+            "prover":      result.certificate.prover,
+            "issued_at":   result.certificate.issued_at,
+            "expires_at":  result.certificate.expires_at,
+        })
+
+    return fn(**result.redacted_params or kwargs)
+
+# Usage
+run_verified_tool(
+    "query_ledger",
+    query_ledger_fn,
+    required_caps=["database:read"],
+    cost=10,
+    sql="SELECT account_id, balance FROM accounts WHERE id = 42",
+)
+```
+
+## Verifying a Certificate Offline
+
+Every certificate embeds the Lean policy fingerprint in its `verified_properties` list as a tag of the form `"policy_model:lean-audited@<fingerprint>"`. An auditor follows these steps to reproduce the proof independently:
+
+<Steps>
+  <Step title="Extract the fingerprint">
+    Read the `verified_properties` list from the stored certificate and find the entry starting with `"policy_model:lean-audited@"`. The hex string after `@` is the Lean source fingerprint.
+
+    ```python
+    for prop in cert["properties"]:
+        if prop.startswith("policy_model:lean-audited@"):
+            fingerprint = prop.split("@")[1]
+            print(fingerprint)  # e.g. "a3f8c1b2d4e57091"
+    ```
+  </Step>
+  <Step title="Match the fingerprint to the source">
+    Check out the Certior repository at the tagged release and verify that the SHA-256 hash of the `lean4/CertiorLattice/Certior/*.lean` files matches the fingerprint. If they match, you are looking at exactly the Lean source that was active when the certificate was issued.
+  </Step>
+  <Step title="Run the proof">
+    Rebuild the Lean policy kernel using the standard Lean toolchain:
+
+    ```bash
+    cd lean4/CertiorLattice && lake build Certior.Audit
+    ```
+  </Step>
+  <Step title="Confirm proof hygiene">
+    After the build completes, verify that:
+    - The four audited guarantees are present: `Certior.Delegation.delegationSafety`, `Certior.Encoding.ifcSoundness`, `Certior.Composition.compositionSoundness`, `SecurityLevel.isValidBoundedLattice`
+    - There are zero `sorry` statements (placeholders for unfinished proofs)
+    - The only axioms in scope are the three Lean standard axioms: `propext`, `Classical.choice`, `Quot.sound`
+
+    You can retrieve this attestation from any live guard:
+
+    ```python
+    print(guard.policy_attestation)
+    # {
+    #   "kernel": "Certior.Lattice + Delegation + Encoding + Composition (Lean 4)",
+    #   "fingerprint": "a3f8c1b2d4e57091",
+    #   "audited_guarantees": [
+    #     "Certior.Delegation.delegationSafety",
+    #     "Certior.Encoding.ifcSoundness",
+    #     "Certior.Composition.compositionSoundness",
+    #     "SecurityLevel.isValidBoundedLattice",
+    #   ],
+    #   "trusted_axioms": ["propext", "Classical.choice", "Quot.sound"],
+    #   "audit_command": "cd lean4/CertiorLattice && lake build Certior.Audit",
+    # }
+    ```
+  </Step>
+</Steps>
+
+## Certificate Integrity Guarantees
+
+Certior's certificate registry enforces six Dafny-verified properties that protect your audit trail:
+
+<Accordion title="P3 — Issuance Integrity">
+  `validate(cert)` returns `True` only if `cert.id` is in the issued set. A certificate cannot be forged by constructing a `VerifiedCertificate` object externally and presenting it for validation — provenance is checked against the live registry.
+</Accordion>
+
+<Accordion title="P4 — Validation Correctness">
+  Validation checks all four conditions independently: (a) provenance, (b) signature, (c) freshness, (d) plan-hash binding. All four must hold. Failure of any single check causes rejection, and the specific check that failed is recorded in the audit log.
+</Accordion>
+
+<Accordion title="P6 — Signature Soundness">
+  Mutating any single identity field — `id`, `theorem`, `plan_hash`, `prover`, or `verified_properties` — invalidates the signature. The signature is computed over a sorted, deterministic JSON representation of these fields, so even reordering the `verified_properties` list invalidates it.
+</Accordion>
+
+<Accordion title="P9 — Registry Monotonicity">
+  The issued-certificate count is strictly increasing and is never decremented. Revoking a certificate removes it from the issued set but does not change `total_issued_count` — every issuance event is permanently recorded.
+</Accordion>
+
+<Accordion title="P10 — Certificate Uniqueness">
+  No two certificates share the same UUID in the registry. A duplicate ID raises `PreconditionViolation` rather than silently overwriting an existing record.
+</Accordion>
+
+<Accordion title="P12 — Revocation Isolation">
+  Revoking certificate X does not affect the validity of any other certificate Y. Selective revocation is safe: revoking a compromised credential does not invalidate surrounding audit trail entries.
+</Accordion>
+
+## Why Certificates Matter for HIPAA and SOX
+
+<CardGroup cols={2}>
+  <Card title="HIPAA" icon="hospital">
+    HIPAA's Security Rule (§164.312) requires audit controls — mechanisms that record and examine activity in systems containing ePHI. Certior certificates provide a per-action tamper-evident record that includes what was accessed, which agent made the call, that PII was redacted before the tool received it, and a cryptographic proof that the call satisfied the active policy. The 6-year retention requirement of the HIPAA policy aligns with HIPAA's 6-year documentation standard.
+  </Card>
+  <Card title="SOX" icon="building-columns">
+    SOX Section 404 requires internal controls over financial reporting, and Section 802 establishes record-retention obligations. Certior certificates provide non-repudiable evidence for every financial-data access — including which capabilities were verified, that MNPI keyword scanning ran, and the Z3 proof trace confirming the action satisfied the active SOX policy. The 7-year retention requirement matches the SOX 7-year document retention standard.
+  </Card>
+</CardGroup>
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="How It Works" href="/concepts/how-it-works" icon="circle-info">
+    See how certificates fit into the full three-gate pipeline.
+  </Card>
+  <Card title="Policies" href="/concepts/policies" icon="file-shield">
+    Understand which policies activate audit-trail requirements and retention periods.
+  </Card>
+</CardGroup>

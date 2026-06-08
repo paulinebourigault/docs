@@ -1,0 +1,196 @@
+---
+title: "Certior Tasks API — Run Verified Agent Executions"
+sidebarTitle: "Tasks"
+description: "Submit a task for verified execution. Certior resolves permissions, runs formal verification gates before each tool call, and returns an execution ID."
+---
+
+The tasks endpoint is the primary way to run a single agent action under Certior's formal verification envelope. You describe the task in natural language, choose a compliance policy, set a budget, and Certior takes care of the rest: resolving your permissions against the policy ceiling, building a signed capability token, running the agent through verification gates before each tool call, and recording immutable proof certificates for every step. You get back an execution ID immediately — the agent runs asynchronously and you track progress over WebSocket or by polling `GET /api/v1/executions/{id}`.
+
+<Note>
+Users with the `viewer` role cannot create tasks. Any requested permissions that exceed the compliance policy ceiling are silently stripped rather than causing an error, unless *all* permissions are stripped — in that case the request is rejected with `403`.
+</Note>
+
+## POST /api/v1/tasks
+
+**Requires authentication.** Returns `201 Created`.
+
+### Request Body
+
+<ParamField body="task" type="string" required>
+  Natural-language description of the task for the agent to execute. Minimum 1 character.
+</ParamField>
+
+<ParamField body="compliance_policy" type="string">
+  The compliance preset to enforce during execution. Accepted values: `hipaa`, `sox`, `legal_privilege`, `default`. When omitted, `default` is used.
+</ParamField>
+
+<ParamField body="budget_cents" type="integer" default="10000">
+  Maximum spend allowed for this execution in US cents. Minimum `100`, maximum `1,000,000`. The runtime blocks tool calls that would exceed the remaining budget.
+</ParamField>
+
+<ParamField body="permissions" type="array of strings">
+  Optional list of permissions to request. When supplied, these are **intersected** with the policy ceiling — they are not used verbatim. Omit to use the policy's default permissions. Example values: `"database:read:patient_data"`, `"document:write:reports"`, `"filesystem:read"`.
+</ParamField>
+
+<ParamField body="provider" type="string">
+  LLM provider override for this task. Accepted values: `anthropic`, `openai`. When omitted, the server's configured default provider is used.
+</ParamField>
+
+<ParamField body="model" type="string">
+  Model override. Examples: `"gpt-4o"`, `"gpt-4o-mini"`, `"claude-haiku-4-5-20251001"`. When omitted, the provider's default model is used.
+</ParamField>
+
+<ParamField body="api_key" type="string">
+  Optional per-request provider API key. When supplied, Certior uses it for this execution only and does not persist it to the execution history. Minimum 8 characters.
+</ParamField>
+
+<ParamField body="webhook_url" type="string">
+  Optional URL to receive a POST callback when the execution reaches a terminal state (`completed`, `failed`, or `cancelled`).
+</ParamField>
+
+<ParamField body="verification_profile" type="object">
+  Optional task-adaptive verification profile. When omitted, Certior infers a profile from the task text and compliance regime.
+
+  <Expandable title="verification_profile fields">
+    <ParamField body="task_class" type="string">
+      Task class override for verification composition. Example: `"clinical_intake"`, `"privacy_review"`.
+    </ParamField>
+
+    <ParamField body="stage_role" type="string">
+      Role of this task in a multi-agent flow. Accepted values: `intake`, `reviewer`, `release`, `single_agent`, `worker`. Tasks with `stage_role: "release"` require `upstream_execution_ids` to be non-empty.
+    </ParamField>
+
+    <ParamField body="stage_id" type="string">
+      Optional stable identifier for this stage, used when you chain execution IDs across tasks.
+    </ParamField>
+
+    <ParamField body="upstream_execution_ids" type="array of strings">
+      Execution IDs from prior stages that this task depends on. Required when `stage_role` is `"release"`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="execution_id" type="string">
+  UUID of the created execution. Use this with `GET /api/v1/executions/{id}` to poll status and retrieve results.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Initial status of the execution. Always `"queued"` on creation.
+</ResponseField>
+
+<ResponseField name="websocket_url" type="string">
+  Full WebSocket URL you can connect to for real-time execution events, for example `ws://localhost:8000/ws/executions/{id}`.
+</ResponseField>
+
+<ResponseField name="verification_profile" type="object">
+  The composed verification profile applied to this execution, including the resolved `required_proofs`, `permission_ceiling`, and stage configuration.
+</ResponseField>
+
+<ResponseField name="permission_resolution" type="object">
+  Included only when you supplied explicit permissions **and** some were denied by the compliance policy. Shows `effective_permissions`, `denied`, and `used_defaults`.
+</ResponseField>
+
+## Examples
+
+<CodeGroup>
+```bash HIPAA Clinical Summarization
+curl -X POST https://<host>/api/v1/tasks \
+  -H "Authorization: Bearer ck-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Summarize a patient encounter into a discharge summary. Redact all direct identifiers. Apply minimum-necessary principle.",
+    "compliance_policy": "hipaa",
+    "budget_cents": 2000,
+    "provider": "openai",
+    "model": "gpt-4o"
+  }'
+```
+
+```bash SOX Financial Query
+curl -X POST https://<host>/api/v1/tasks \
+  -H "Authorization: Bearer ck-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Retrieve Q3 revenue figures from the financial database and write a summary report.",
+    "compliance_policy": "sox",
+    "budget_cents": 5000,
+    "permissions": ["database:read:financial_data", "document:write:reports"]
+  }'
+```
+
+```bash Multi-Agent Reviewer Stage
+curl -X POST https://<host>/api/v1/tasks \
+  -H "Authorization: Bearer ck-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Review the clinical intake note for residual PHI, privilege leakage, and minimum-necessary compliance. Return a structured GO/NO-GO assessment.",
+    "compliance_policy": "legal_privilege",
+    "budget_cents": 1200,
+    "verification_profile": {
+      "task_class": "privacy_review",
+      "stage_role": "reviewer",
+      "stage_id": "privacy-review",
+      "upstream_execution_ids": ["a1b2c3d4-..."]
+    }
+  }'
+```
+</CodeGroup>
+
+### Successful Response
+
+```json
+{
+  "execution_id": "9d7e4f2a-1c3b-4e5a-8f6d-0a1b2c3d4e5f",
+  "status": "queued",
+  "websocket_url": "ws://localhost:8000/ws/executions/9d7e4f2a-1c3b-4e5a-8f6d-0a1b2c3d4e5f",
+  "verification_profile": {
+    "task_class": "clinical_intake",
+    "stage_role": "intake",
+    "required_proofs": ["no_phi_external_flow", "minimum_necessary_access", "authorized_user_only"],
+    "permission_ceiling": ["database:read:patient_data", "document:write:reports", "filesystem:read"]
+  },
+  "permission_resolution": null
+}
+```
+
+### Permission Denial Response (403)
+
+When all requested permissions are stripped by the compliance policy, Certior returns a structured `403`:
+
+```json
+{
+  "detail": {
+    "message": "No effective permissions after applying 'hipaa' compliance policy",
+    "denied": [
+      {
+        "permission": "network:http:read",
+        "reason": "exceeds_policy_ceiling",
+        "detail": "Permission is not within the HIPAA policy allowed set"
+      }
+    ]
+  }
+}
+```
+
+## Error Responses
+
+| Status | When it occurs |
+|--------|---------------|
+| `400` | Unknown compliance policy name or invalid `stage_role` / `stage_id` combination |
+| `401` | Missing or invalid API key |
+| `403` | `viewer` role attempted to create a task, or all requested permissions were denied by the policy ceiling |
+| `422` | Request body failed schema validation (e.g., `budget_cents` below minimum) |
+
+## What Happens After Submission
+
+After you receive the `execution_id`, Certior runs the following pipeline asynchronously:
+
+1. **Queued** — the execution is accepted and placed in the task queue.
+2. **Planning** — the agent produces a step-by-step execution plan.
+3. **Executing** — the agent calls tools; verification gates intercept each call and check it against budget, scope, and information-flow constraints before allowing it to proceed.
+4. **Certificate issuance** — a proof certificate is written for each verified step.
+5. **Completion** — status moves to `completed` (or `failed`). Results, output, and certificate IDs are available on the execution record.
+
+Poll `GET /api/v1/executions/{execution_id}` to read results, or stream events in real time over the WebSocket URL returned in the response.

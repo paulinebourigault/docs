@@ -1,0 +1,124 @@
+---
+title: "OpenAI Tool Calling with Certior: 10-Minute Setup"
+sidebarTitle: "OpenAI Setup"
+description: "Add verify_tool_calls() to your OpenAI agent loop in under ten minutes — capability, content, and budget gates with signed certificates for every call."
+---
+
+If you have an OpenAI agent that calls tools, you are one function away from a provable boundary around it. This guide takes you from a bare `client.chat.completions.create()` loop to a fully guarded setup with capability checks, content policy, budget enforcement, and signed certificates — with no live OpenAI key required to verify it works.
+
+<Steps>
+  <Step title="Install Certior">
+    Certior requires Python 3.11 or later. Install it from PyPI:
+
+    ```bash
+    pip install certior
+    ```
+
+    This pulls in `z3-solver` and the Lean policy fingerprint metadata. No system packages, no Docker.
+
+    <Note>
+      Certior is in **private beta**. If you hit a 404 or access error, email **hello@certior.io** to request access.
+    </Note>
+  </Step>
+
+  <Step title="Drop verify_tool_calls() into your agent loop">
+    Find the spot in your existing code where you iterate over tool calls:
+
+    ```python
+    # Before Certior
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        tools=tool_specs,
+    )
+    for call in response.choices[0].message.tool_calls:
+        result = execute_tool(call.function.name, json.loads(call.function.arguments))
+    ```
+
+    Replace it with this:
+
+    ```python
+    from certior import Guard
+    from certior.adapters.tool_use import verify_tool_calls
+
+    guard = Guard(
+        permissions=["network:http:read", "filesystem:read"],  # what this agent may do
+        budget_cents=5000,                                      # hard spending ceiling
+        policy="hipaa",       # PII / PHI redaction; or "sox", "legal_privilege", "default"
+    )
+
+    CERTIOR_TOOL_SPECS = {
+        "search_web": {"required_capabilities": ["network:http:read"], "cost_cents": 2},
+        "read_file":  {"required_capabilities": ["filesystem:read"],   "cost_cents": 1},
+        # add one row per tool your agent has access to
+    }
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        tools=tool_specs,
+    )
+
+    verified = verify_tool_calls(
+        guard,
+        response.choices[0].message.tool_calls,
+        tool_specs=CERTIOR_TOOL_SPECS,
+    )
+
+    for call in verified:
+        if call["allowed"]:
+            result = execute_tool(call["name"], call["input"])
+            archive(call["certificate"])               # signed receipt — keep for audit
+        else:
+            log_blocked(call["name"], call["reason"])  # never reaches your executor
+    ```
+
+    Five lines of setup, one row per tool in `CERTIOR_TOOL_SPECS`, and one `if/else` on the result. Your `execute_tool` function is unchanged.
+
+    <Tip>
+      The `certificate` in each allowed call is a JSON-serialisable object. Persist it alongside the tool output in your database or audit store. It carries the Lean policy fingerprint (`policy_fingerprint`), the Z3 proof trace, and a signature you can re-verify offline at any time.
+    </Tip>
+  </Step>
+
+  <Step title="Pick a compliance policy">
+    The `policy` parameter on `Guard` controls what the Content gate scans for. Capability and Budget gates run regardless of the policy you choose.
+
+    | Policy | What it adds | Use for |
+    |---|---|---|
+    | `"default"` | Capability + budget gates only | Most agents, development, testing |
+    | `"hipaa"` | PHI detection and redaction, 6-year audit retention | Healthcare, research with patient data |
+    | `"sox"` | MNPI detection, 7-year retention, segregation of duties | Trading, finance, M&A workflows |
+    | `"legal_privilege"` | Attorney-client privilege protection | Legal review, contract drafting |
+
+    Custom policies are also supported — see the [API Reference](/api/overview) for details on building a policy delta in Python.
+  </Step>
+</Steps>
+
+## Other framework adapters
+
+`verify_tool_calls()` works with OpenAI, Anthropic, and MCP tool-call shapes. Every other major framework has a dedicated adapter that normalises the tool-call shape to the same verification pipeline.
+
+| Framework | Adapter | Import |
+|---|---|---|
+| **OpenAI tool use** | `verify_tool_calls()` | `from certior.adapters.tool_use import verify_tool_calls` |
+| **Anthropic `tool_use`** | Same `verify_tool_calls()` — native shape, no transform needed | `from certior.adapters.tool_use import verify_tool_calls` |
+| **LangChain** | `CertiorCallbackHandler` | `from certior.adapters.langchain import CertiorCallbackHandler` |
+| **CrewAI (single tool)** | `certior_tool_wrapper` decorator | `from certior.adapters.crewai import certior_tool_wrapper` |
+| **CrewAI (full crew)** | `guard_crew_tools()` | `from certior.adapters.crewai import guard_crew_tools` |
+| **MCP servers** | Same `verify_tool_calls()` — MCP tools normalise the same way | `from certior.adapters.tool_use import verify_tool_calls` |
+| **Custom loop / any callable** | `guard.verify()` or `@guard.wrap()` | `from certior import Guard` |
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="pip install fails on z3-solver">
+    `z3-solver` requires Python 3.11, 3.12, or 3.13 to find a pre-built wheel. Older versions of Python require compiling from source, which may fail in some environments. Upgrade to Python 3.11 or later and retry.
+  </Accordion>
+  <Accordion title="WSL: can't open Studio in the Windows browser">
+    Try `http://localhost:3001` first, then `http://127.0.0.1:3001`. If neither works, get your WSL VM's IP with `hostname -I` and use that address directly in the browser.
+  </Accordion>
+</AccordionGroup>
+
+## Need help with a real integration?
+
+Send your tool spec, your loop shape, and what you want guarded to **hello@certior.io** — we'll review the diff.

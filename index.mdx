@@ -1,0 +1,66 @@
+---
+title: "Certior — Provable Safety for AI Agent Tool Calls"
+description: "Certior wraps AI agent tool calls in three formally verified gates — Capability, Content, and Budget — and returns a signed certificate you can audit."
+---
+
+Certior is a drop-in safety wrapper for AI agent tool calls. Before any tool runs, Certior checks that the agent has the right capabilities, that the content contains no policy violations, and that the call fits within the agent's spending ceiling. Allowed calls return a signed certificate tied to a Lean-verified policy model. Blocked calls raise `CertiorBlocked` with a precise, human-readable reason. One import, one class, one decorator — and your agents operate inside provable boundaries.
+
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand the three-gate model, what a signed certificate means, and why formal verification matters.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Certior, add a Guard, and see your first allowed and blocked tool calls in under five minutes.
+  </Card>
+  <Card title="OpenAI Guide" icon="wand-magic-sparkles" href="/quickstart-openai">
+    Drop `verify_tool_calls()` into your existing OpenAI tool-calling loop in under ten minutes.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for `Guard`, `VerifyResult`, `CertiorBlocked`, `Policy`, and all framework adapters.
+  </Card>
+</CardGroup>
+
+## How it works in three steps
+
+Every tool call travels through the same three-step pipeline before your executor ever sees it.
+
+<Steps>
+  <Step title="Install and configure a Guard">
+    Install Certior with pip and create a `Guard` with the permissions, policy, and budget your agent is allowed to use. Zero mandatory configuration — sensible defaults let you start immediately and tighten the boundary later.
+
+    ```bash
+    pip install certior
+    ```
+  </Step>
+  <Step title="Verify before you execute">
+    Pass every tool call through `guard.verify()` or decorate your tool functions with `@guard.wrap()`. Certior runs the Capability, Content, and Budget gates in sequence, typically in under ten milliseconds.
+
+    ```python
+    from certior import Guard, CertiorBlocked
+
+    guard = Guard(permissions=["network:http:read"], budget_cents=5000)
+
+    result = guard.verify(
+        tool="web_fetch",
+        params={"url": "https://example.com"},
+        required_capabilities=["network:http:read"],
+        cost_cents=2,
+    )
+
+    if result.allowed:
+        output = web_fetch(result.redacted_params)
+    ```
+  </Step>
+  <Step title="Collect signed certificates for audit">
+    Every call that passes a real Z3 verification returns a signed `certificate` bound to the Lean policy fingerprint. Persist these in your `audit_log` and replay them at any time to prove exactly which policy was in force when each tool ran.
+
+    ```python
+    for entry in guard.audit_log:
+        print(entry["tool"], entry["allowed"], entry["latency_ms"])
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Certior is currently in **private beta**. Install it directly from PyPI with `pip install certior` (Python 3.11 or later required). To join the beta or request an integration review, email **hello@certior.io**.
+</Note>

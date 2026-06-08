@@ -1,0 +1,133 @@
+---
+title: "Building and Enabling certior-flow-check"
+sidebarTitle: "Lean Binary"
+description: "Build the certior-flow-check Lean 4 binary to add live per-plan flow verification on top of Certior's always-on Z3 gate."
+---
+
+`certior-flow-check` is a Lean 4 executable that adds a second formal verification layer to every plan the Certior runtime processes. When the binary is present, each plan is type-checked against the proven `Certior.Delegation` and `Certior.Encoding` lattice operations, and the runtime attaches a Lean-issued proof certificate to `VerifyResult.certificate` alongside the Z3 certificate. Without the binary, the runtime falls back to a Python subset check and issues only the Z3 certificate.
+
+## Why the binary ships separately from the pip package
+
+The compiled binary is approximately 93 MB (dynamically linked ELF on Linux x86\_64, comparable on other platforms). PyPI's per-file size limit and the cost of forcing every user — including those on Windows or macOS who would not benefit from a Linux binary — to download a 90+ MB Lean artefact would more than double the wheel download for a feature most users do not need at first. The pip package stays a pure-Python ~410 KB wheel; you build the binary once locally when you want live Lean verification.
+
+## When you need it
+
+You need `certior-flow-check` if you want:
+
+- **Dual-proof certificates.** `VerifyResult.certificate` includes both a Z3 certificate and a Lean certificate, giving auditors independently verifiable evidence from two formal systems.
+- **Live flow checking.** Each plan is type-checked against the machine-proven delegation lattice at request time, not just at CI time.
+- **Lean-backed compliance exports.** Exported audit packages reference Lean flow evidence when the binary participated in the run.
+
+Without the binary, Certior still provides Z3-backed capability checking, content scanning, budget enforcement, and signed certificates — the Z3 gate is always on regardless of whether the Lean binary is present.
+
+## What changes with vs without the binary
+
+| Aspect | Without `certior-flow-check` | With `certior-flow-check` |
+|---|---|---|
+| Z3 capability / budget gate | ✅ Runs | ✅ Runs |
+| Content scanner | ✅ Runs | ✅ Runs |
+| Per-plan Lean flow check | Falls back to Python subset check | ✅ Runs the Lean verifier |
+| `policy_attestation.fingerprint` | Unchanged | Unchanged |
+| `VerifyResult.certificate` | Z3 certificate only | Z3 certificate + Lean certificate |
+| Latency per `verify()` | ~10–50 ms | ~50–150 ms |
+
+## How to build it
+
+### Prerequisites
+
+You need the [`elan`](https://github.com/leanprover/elan) Lean toolchain manager. Install it with:
+
+```bash
+curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh
+source "$HOME/.elan/env"
+```
+
+### Build
+
+From a full clone of the Certior repository, run the build script:
+
+```bash
+./scripts/build-lean-binary.sh
+```
+
+The first build takes **5–15 minutes** depending on your CPU and dependency cache state. Subsequent builds are incremental and complete in seconds.
+
+The output binary lands at:
+
+```
+lean4/CertiorPlan/.lake/build/bin/certior-flow-check
+```
+
+### Verify the build
+
+Confirm the binary works by feeding it an empty plan:
+
+```bash
+echo '{"steps": []}' | $CERTIOR_FLOW_CHECK_BINARY
+```
+
+A working binary prints a JSON verdict — typically `{"ok": true, ...}` for an empty plan — and exits `0`.
+
+## How to enable it
+
+Export the absolute path to the binary before starting the Certior runtime:
+
+```bash
+export CERTIOR_FLOW_CHECK_BINARY="$(pwd)/lean4/CertiorPlan/.lake/build/bin/certior-flow-check"
+```
+
+For long-running services, add the variable to your process manager configuration — systemd unit, Docker environment file, Kubernetes Secret or ConfigMap — rather than relying on shell profile loading. This ensures the variable is present whether the process starts interactively or via an init system.
+
+<CodeGroup>
+  ```ini systemd
+  [Service]
+  Environment="CERTIOR_FLOW_CHECK_BINARY=/opt/certior/lean4/CertiorPlan/.lake/build/bin/certior-flow-check"
+  ```
+
+  ```bash Docker
+  docker run \
+    -e CERTIOR_FLOW_CHECK_BINARY=/opt/certior/lean4/CertiorPlan/.lake/build/bin/certior-flow-check \
+    certior:latest
+  ```
+
+  ```bash Shell
+  export CERTIOR_FLOW_CHECK_BINARY="$(pwd)/lean4/CertiorPlan/.lake/build/bin/certior-flow-check"
+  ```
+</CodeGroup>
+
+## Auto-discovery order
+
+The runtime discovers the binary in three places, in priority order:
+
+1. **`CERTIOR_FLOW_CHECK_BINARY` environment variable** — must be an absolute path to an existing file
+2. **Default Lake build output** — `lean4/CertiorPlan/.lake/build/bin/certior-flow-check` relative to the installed Certior package
+3. **System `PATH`** — `certior-flow-check` must be on the path
+
+If none of these resolve, the runtime logs a one-time warning at startup and uses the Python subset check for the remainder of the process lifetime.
+
+## Downloading a prebuilt binary from CI
+
+If you do not want to install the Lean toolchain locally, you can download a prebuilt binary from the Certior GitHub Actions artifacts. The CI workflow builds `certior-flow-check` on every commit for both Linux and macOS:
+
+| Platform | Artifact name |
+|---|---|
+| Linux x86\_64 | `certior-flow-check-linux-x86_64` |
+| macOS ARM64 | `certior-flow-check-macos-arm64` |
+
+Artifacts are retained for 30 days and are available from the Actions tab of the GitHub repository. Download a specific run's artifact with:
+
+```bash
+gh run download <run-id> --name certior-flow-check-linux-x86_64
+```
+
+<Note>
+  Building the binary does not introduce new trust assumptions. The lattice module it checks against — `Certior.Delegation` and `Certior.Encoding` — is the same module whose soundness theorems are audited in CI against Lean's three standard axioms. You are executing a verifier whose rules have already been machine-checked.
+</Note>
+
+## Performance notes
+
+With the binary enabled, `verify()` latency increases from the Z3-only range of ~10–50 ms to approximately ~50–150 ms per call. This is the cost of spawning the Lean process, passing the plan over stdin, and parsing the verdict back. The tradeoff is a second independent formal certificate attached to every allowed call.
+
+<Tip>
+  For latency-sensitive pipelines, enable the binary in CI and compliance export workflows where the dual-proof certificate matters, and use Z3-only mode in high-throughput production paths where the single Z3 certificate is sufficient.
+</Tip>

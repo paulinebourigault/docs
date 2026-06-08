@@ -1,0 +1,120 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Certior",
+  "projectDescription": "A formally verified safety wrapper for AI agent tool calls — capability, content, and budget gates backed by Z3 runtime enforcement and a Lean-checked policy model, issuing signed certificates per call.",
+  "theme": "luma",
+  "primaryColor": "#0F172A",
+  "lightColor": "#3B82F6",
+  "darkColor": "#1E3A5F",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "quickstart-openai"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/capability-model",
+              "concepts/policies",
+              "concepts/certificates"
+            ]
+          },
+          {
+            "group": "Framework Guides",
+            "pages": [
+              "guides/openai",
+              "guides/langchain",
+              "guides/crewai",
+              "guides/openclaw",
+              "guides/custom-loop"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/github-action",
+              "integrations/studio",
+              "integrations/skill-audit"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/configuration",
+              "reference/trust-package",
+              "reference/lean-binary"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/tasks",
+              "api/executions",
+              "api/workflows",
+              "api/compliance",
+              "api/releases"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Z3 SMT runtime gate — every tool call is checked in tens of milliseconds",
+    "Lean 4 policy model — 155 theorems proving capability lattice, delegation, IFC, and composition soundness with 0 sorry",
+    "Signed certificates per tool call bound to the Lean policy fingerprint for auditor reproducibility",
+    "Pre-built compliance policies: HIPAA, SOX, legal privilege, and default",
+    "Drop-in adapters for OpenAI, LangChain, CrewAI, OpenClaw, and any custom agent loop",
+    "Budget gate — per-agent spending ceiling with per-step debit",
+    "Content safety gate — PII detection, redaction, and blocking on prompts and outputs",
+    "certior-skill-audit CLI for static capability-subset checks on OpenClaw skills",
+    "Certior Studio — optional web UI for interactive runs and verification graph inspection",
+    "GitHub Action and VS Code extension for policy enforcement in CI and the editor"
+  ],
+  "publicApiSurface": [
+    "Guard(policy, permissions, budget_cents, on_violation, auto_redact)",
+    "Guard.verify(tool, params, content, required_capabilities, cost_cents)",
+    "Guard.wrap(fn, tool_name, required_capabilities, cost_cents)",
+    "Guard.check(tool, content) — context manager",
+    "VerifyResult(allowed, reason, violations, redacted_params, certificate, latency_ms)",
+    "CertiorBlocked — exception raised on blocked calls",
+    "Policy enum: DEFAULT, HIPAA, SOX, LEGAL, LEGAL_PRIVILEGE",
+    "certior.adapters.tool_use.verify_tool_calls(guard, tool_calls, tool_specs)",
+    "certior.adapters.tool_use.CertiorMiddleware(policy)",
+    "certior.adapters.langchain.CertiorCallbackHandler(guard)",
+    "certior.adapters.crewai.certior_tool_wrapper(guard, tool_name)",
+    "certior.adapters.crewai.guard_crew_tools(crew, guard)",
+    "certior.adapters.openclaw.GuardedAgent(agent, guard)",
+    "certior.adapters.openclaw.CertiorCallbackHandler(guard)",
+    "certior-skill-audit CLI: --permission, --allow-undeclared, --expected-fingerprint",
+    "POST /api/v1/tasks",
+    "GET /api/v1/executions/{id}",
+    "POST /api/v1/workflows",
+    "GET /api/v1/workflows/{id}",
+    "GET /api/v1/compliance/{execution_id}/export?preset=hipaa",
+    "GET /api/v1/releases/decision",
+    "POST /api/v1/releases/promote",
+    "GET /api/v1/trust/badge?repo=&commit="
+  ]
+}

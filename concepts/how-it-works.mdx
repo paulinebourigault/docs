@@ -1,0 +1,137 @@
+---
+title: "How Certior Works: The Verified Three-Gate Pipeline"
+sidebarTitle: "How It Works"
+description: "Every tool call passes three gates before executing. Allowed calls return a signed certificate. Blocked calls raise CertiorBlocked with a clear reason."
+---
+
+Every time an AI agent tries to call a tool, Certior runs three sequential gates before the call is allowed to execute. These gates are not advisory checks — they are enforced by a combination of formally verified policy rules (proven sound in Lean 4) and per-call runtime evaluation (run by the Z3 SMT solver in tens of milliseconds). If all three gates pass, your tool call proceeds and you receive a signed certificate proving the decision. If any gate blocks, Certior raises `CertiorBlocked` immediately with a precise, machine-readable reason.
+
+## The Three-Gate Pipeline
+
+The gates run in order. A failure at any gate short-circuits the remaining checks and raises `CertiorBlocked` — no budget is consumed and no certificate is issued.
+
+| Gate | What it checks | How it's enforced |
+|---|---|---|
+| **Capability** | The tool's `required_capabilities` are a strict subset of the parent `Guard`'s `permissions`; no privilege escalation is possible | Lean 4 proves the delegation rule is sound; Z3 evaluates it on every call |
+| **Content** | Prompts and parameters are scanned for PII, PHI, secrets, MNPI, attorney-client material, and other policy-defined categories; matching content is blocked or auto-redacted | Compliance policy presets (`hipaa`, `sox`, `legal_privilege`) backed by keyword, pattern, and PII detectors |
+| **Budget** | The estimated `cost_cents` for this call does not exceed the agent's remaining balance; every allowed call debits the parent `Guard` | Running atomic ledger; failed executions are automatically rolled back |
+
+## What Happens on an Allowed Call
+
+When all three gates pass, Certior:
+
+<Steps>
+  <Step title="Issues a signed certificate">
+    A signed `VerifyResult.certificate` is created and added to the tamper-evident audit registry. The certificate includes a SHA-256 action hash, a Lean policy fingerprint, a Z3 proof trace, and a list of verified properties. The signature covers all identity fields — any tampering invalidates it.
+  </Step>
+  <Step title="Debits the budget">
+    The `cost_cents` you specified is atomically deducted from the guard's remaining balance. If the call itself raises an exception, the reservation is automatically rolled back.
+  </Step>
+  <Step title="Appends to the audit log">
+    An entry is added to `guard.audit_log` recording the tool name, allowed status, latency, PII count, and wall-clock timestamp.
+  </Step>
+  <Step title="Returns a VerifyResult">
+    `result.allowed` is `True`, `result.certificate` holds the signed proof object, and `result.redacted_content` / `result.redacted_params` contain any auto-redacted versions of your inputs.
+  </Step>
+</Steps>
+
+```python
+from certior import Guard
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["filesystem:read", "network:http:read"],
+    budget_cents=5000,
+)
+
+result = guard.verify(
+    tool="fetch_patient_record",
+    params={"record_id": "P-4821"},
+    content="Retrieve record for patient John Doe, DOB 1980-01-15",
+    required_capabilities=["filesystem:read"],
+    cost_cents=10,
+)
+
+if result.allowed:
+    # certificate is attached — safe to proceed with redacted inputs
+    run_tool(result.redacted_params)
+    print(result.certificate.plan_hash)   # sha256:abc123...
+```
+
+## What Happens on a Blocked Call
+
+When any gate fails, Certior raises `CertiorBlocked` (when using `guard.wrap`) or returns a `VerifyResult` with `allowed=False` (when using `guard.verify` directly). No budget is consumed and no certificate is issued.
+
+```python
+from certior import Guard, CertiorBlocked
+
+guard = Guard(permissions=["filesystem:read"])  # network NOT granted
+
+@guard.wrap(required_capabilities=["network:http:read"])
+def web_fetch(url: str): ...
+
+try:
+    web_fetch("https://example.com")
+except CertiorBlocked as e:
+    print(e.result.reason)
+    # → "Capability 'network:http:read' not in agent permissions"
+    print(e.result.violations[0].category)
+    # → "capability"
+```
+
+`CertiorBlocked.result` is a full `VerifyResult` object. You can inspect `result.violations` for a structured list of every specific failure, including category (`capability`, `budget`, `phi_exposure`, `mnpi_leak`, etc.) and detail text.
+
+## Z3 Runtime Enforcement vs. Lean 4 Offline Proof
+
+Certior uses two complementary verification technologies, each playing a different role:
+
+<CardGroup cols={2}>
+  <Card title="Z3 (Runtime — runs every call)" icon="bolt">
+    Z3 is a fast SMT solver that evaluates capability constraints and budget arithmetic on every tool call. It produces a machine-checked verdict in tens of milliseconds. When Z3 approves a call, the result is recorded in the `proof_trace` field of your certificate, for example: `"Z3 SAT in 4.2ms, policy: Lean-audited @ a3f8c1b2d4e57091"`.
+  </Card>
+  <Card title="Lean 4 (Offline — runs in CI)" icon="shield-check">
+    Lean 4 is a proof assistant that verifies the *rules themselves* — the capability lattice, delegation soundness, information-flow composition, and encoding correctness — as mathematical theorems. These 155 theorems are proven once and checked in CI on every commit. Z3 enforces the rules; Lean proves those rules are correct.
+  </Card>
+</CardGroup>
+
+<Note>
+  A plain-English summary: Lean 4 proves that "the delegation rule is logically sound." Z3 proves that "this specific call satisfies the delegation rule right now." Both verdicts are recorded in every certificate.
+</Note>
+
+You can inspect the Lean policy attestation for any guard at runtime:
+
+```python
+print(guard.policy_attestation)
+# {
+#   "kernel": "Certior.Lattice + Delegation + Encoding + Composition (Lean 4)",
+#   "fingerprint": "a3f8c1b2d4e57091",
+#   "audited_guarantees": [
+#     "Certior.Delegation.delegationSafety",
+#     "Certior.Encoding.ifcSoundness",
+#     "Certior.Composition.compositionSoundness",
+#     "SecurityLevel.isValidBoundedLattice",
+#   ],
+#   "trusted_axioms": ["propext", "Classical.choice", "Quot.sound"],
+#   "audit_command": "cd lean4/CertiorLattice && lake build Certior.Audit",
+# }
+```
+
+An auditor can reproduce the entire proof offline by matching the `fingerprint` to the Lean source and running `lake build Certior.Audit`. If there are zero `sorry` statements and the four guarantees depend only on the three listed standard axioms, the policy model is sound.
+
+<Warning>
+  Certior proves the **boundary** the agent operates inside — not the correctness of LLM outputs. If a tool call violates the policy, it is provably blocked. Whether the LLM's natural language reasoning is correct is outside Certior's scope.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Capability Model" href="/concepts/capability-model" icon="key">
+    Learn how permission strings work and how capabilities flow from parent to child guards.
+  </Card>
+  <Card title="Policies" href="/concepts/policies" icon="file-shield">
+    Explore the four built-in compliance policies and how to configure them.
+  </Card>
+  <Card title="Certificates" href="/concepts/certificates" icon="certificate">
+    Understand what a signed certificate contains and how auditors verify it.
+  </Card>
+</CardGroup>

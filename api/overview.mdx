@@ -1,0 +1,98 @@
+---
+title: "Certior REST API — Overview and Endpoint Reference"
+sidebarTitle: "Overview"
+description: "The Certior REST API covers verified task execution, workflow orchestration, compliance audit export, and CI/CD release gating under the /api/v1/ prefix."
+---
+
+The Certior REST API is a JSON-over-HTTP interface that sits at the boundary between your application and formally verified agent execution. Every route is prefixed with `/api/v1/` and requires authentication via an API key. You submit a task, Certior runs it through a chain of verification gates before any tool call reaches the real world, then hands back a structured execution record plus machine-readable proof certificates you can attach directly to a compliance audit.
+
+## Base URL
+
+```
+https://<your-certior-host>/api/v1
+```
+
+During local development the default host is `http://127.0.0.1:8000`. In production, point your client at the public address for your deployed Certior instance.
+
+## Versioning
+
+All stable endpoints live under the `/api/v1/` prefix. The version is encoded in the URL path — never in a header.
+
+<Note>
+Certior follows strict backward-compatibility rules for every `v1` endpoint. Fields will not be removed, renamed, or have their types changed. New optional fields may be added in minor releases; your client must silently ignore unknown fields. Enum values such as `"SHIP"` and `"NO_SHIP"` will never be renamed. If a breaking change becomes unavoidable, Certior introduces a new `/api/v2/` prefix, marks the old endpoint `[Deprecated]` in the OpenAPI schema, and maintains full `v1` operation for a **minimum of six months** before removal.
+</Note>
+
+## Response Format
+
+Every successful response is a JSON object. Collections return a JSON array. Error responses use the following envelope:
+
+```json
+{
+  "detail": "Human-readable description of the error."
+}
+```
+
+For structured errors (such as permission denials), `detail` may itself be a JSON object:
+
+```json
+{
+  "detail": {
+    "message": "No effective permissions after applying 'hipaa' compliance policy",
+    "denied": [
+      {
+        "permission": "network:http:read",
+        "reason": "exceeds_policy_ceiling",
+        "detail": "Permission is not within the HIPAA policy allowed set"
+      }
+    ]
+  }
+}
+```
+
+## Standard HTTP Status Codes
+
+| Code | Meaning |
+|------|---------|
+| `200` | Success (GET / DELETE returning a body) |
+| `201` | Created (POST that created a new resource) |
+| `400` | Invalid request body or unknown compliance preset |
+| `401` | Missing or invalid API key |
+| `403` | Authenticated but forbidden — role or policy ceiling exceeded |
+| `404` | Resource not found |
+| `409` | Conflict — resource is already in a terminal state |
+| `422` | Request body failed schema validation |
+| `500` | Unexpected server error — retry the request or contact support |
+| `501` | Feature not available (e.g., PDF export without `reportlab`) |
+
+## Endpoint Quick Reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/auth/register` | Register a new user and receive an API key |
+| `POST` | `/api/v1/auth/login` | Authenticate with email/password and receive an API key |
+| `POST` | `/api/v1/auth/rotate` | Rotate the authenticated caller's API key |
+| `GET` | `/api/v1/auth/me` | Return the authenticated user's profile |
+| `POST` | `/api/v1/tasks` | Submit a task for verified execution |
+| `GET` | `/api/v1/executions` | List executions for the authenticated user |
+| `GET` | `/api/v1/executions/{id}` | Retrieve a single execution's status and results |
+| `DELETE` | `/api/v1/executions/{id}` | Cancel a queued or planning execution |
+| `POST` | `/api/v1/workflows` | Create and immediately start a multi-stage workflow |
+| `GET` | `/api/v1/workflows` | List workflows for the authenticated user |
+| `GET` | `/api/v1/workflows/{id}` | Retrieve a workflow's status and per-stage results |
+| `DELETE` | `/api/v1/workflows/{id}` | Cancel a running workflow |
+| `GET` | `/api/v1/workflows/{id}/export` | Export the full workflow audit package as JSON |
+| `GET` | `/api/v1/compliance/presets` | List available compliance presets (public) |
+| `GET` | `/api/v1/compliance/{execution_id}/export` | Export a compliance audit package for an execution |
+| `GET` | `/api/v1/releases/decision` | Get the current release readiness decision for a repo |
+| `GET` | `/api/v1/releases/health` | Get ingest health and evidence freshness for a repo |
+| `POST` | `/api/v1/releases/promote` | Record an audit-grade promotion or rejection decision |
+| `GET` | `/api/v1/releases/promotions` | List promotion history for a repo |
+| `POST` | `/api/v1/releases/github-webhook` | Receive GitHub pull-request events and post a trust comment |
+| `GET` | `/api/v1/trust/badge` | Return an SVG trust badge for a repository |
+| `POST` | `/api/v1/tokens` | Issue a capability token |
+| `GET` | `/api/v1/tokens/{id}` | Inspect a capability token |
+| `GET` | `/health` | Server health, version, mode, and tool availability |
+
+## OpenAPI Schema
+
+The live server exposes its full OpenAPI schema at `/docs` (Swagger UI) and `/redoc` (ReDoc). Both interfaces include request/response examples and support authenticated requests directly from the browser.

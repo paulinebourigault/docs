@@ -1,0 +1,275 @@
+---
+title: "Certior with OpenClaw: Guard Agents, Pipelines, and Skills"
+sidebarTitle: "OpenClaw"
+description: "Protect OpenClaw agents from all eight published threat classes with GuardedAgent, CertiorCallbackHandler, and the static pre-install skill auditor."
+---
+
+Certior's OpenClaw adapter is the most complete of the framework integrations, because OpenClaw's own callback architecture creates a subtle gap that requires two distinct surfaces to close. This page explains why both surfaces exist, how to combine them, and how to use the skill auditor to vet third-party tools before they ever run.
+
+## Install
+
+```bash
+pip install certior openclaw-sdk
+```
+
+## Two surfaces, distinct jobs
+
+OpenClaw's `CompositeCallbackHandler` is documented to **swallow exceptions raised by callback handlers** so one failing handler does not block the others. That design is sensible for observability hooks, but it means a `CertiorBlocked` exception raised from inside a callback never actually stops a tool call. Certior therefore exposes two surfaces with different jobs:
+
+<CardGroup cols={2}>
+  <Card title="GuardedAgent" icon="lock">
+    **The enforcement primitive.** Wraps an `openclaw_sdk.Agent` so its `.execute()` runs Certior's input gate, blocks on a blocked verdict, then scans the output before it returns to the caller. Blocked verdicts raise `CertiorBlocked` from outside the OpenClaw callback chain — the underlying agent's `execute()` is never called on a blocked input. **Use this when you need to actually block calls.**
+  </Card>
+  <Card title="CertiorCallbackHandler" icon="chart-line">
+    **Observability + accounting.** Attached to the `OpenClawClient`, it debits the budget, scans content, and emits audit-trail entries on every `agent.execute()` call. A `CertiorBlocked` it raises is logged by OpenClaw but does not stop the call. **Use this alongside `GuardedAgent` — never instead of it.**
+  </Card>
+</CardGroup>
+
+<Warning>
+Using only `CertiorCallbackHandler` without `GuardedAgent` means violations are **logged but not blocked**. OpenClaw's callback exception-swallowing is documented behaviour. Always wrap your agent in `GuardedAgent` when enforcement matters.
+</Warning>
+
+## Basic usage pattern
+
+```python
+import asyncio
+from certior import Guard
+from certior.adapters.openclaw import GuardedAgent, CertiorCallbackHandler
+from openclaw_sdk import OpenClawClient
+
+guard = Guard(
+    policy="default",                                    # or "hipaa" / "sox" / "legal_privilege"
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    agent_id="research-bot",
+)
+
+async def run():
+    async with OpenClawClient.connect(
+        callbacks=[CertiorCallbackHandler(guard)],       # accounting + audit trail
+    ) as client:
+        # Wrap for actual blocking:
+        agent = GuardedAgent(client.get_agent("research-bot"), guard)
+        result = await agent.execute("Summarise public AI safety research")
+        print(result)
+
+asyncio.run(run())
+```
+
+`GuardedAgent` accepts any object with an async `execute(query, **kwargs)` method returning a result with a `.content` attribute — it is not limited to `openclaw_sdk.Agent` instances.
+
+## What GuardedAgent verifies on each call
+
+```python
+async def execute(self, query: str, **kwargs) -> Any:
+    # 1) Input gate: capability + content + budget
+    #    A blocked verdict here halts dispatch — the wrapped
+    #    agent's execute() is never called.
+    input_verdict = self.guard.verify(
+        tool=f"openclaw:{agent_id}",
+        content=query,
+        params={k: v for k, v in kwargs.items() if isinstance(v, str)},
+        cost_cents=1,
+    )
+    if input_verdict.blocked:
+        raise CertiorBlocked(input_verdict)
+
+    # 2) Run the wrapped agent
+    result = await self.agent.execute(query, **kwargs)
+
+    # 3) Output gate: scan result.content for sensitive data
+    #    A blocked verdict here raises — the result never reaches
+    #    the caller.
+    if scannable_content:
+        output_verdict = self.guard.verify(
+            tool=f"openclaw:{agent_id}:output",
+            content=result.content,
+            cost_cents=0,
+        )
+        if output_verdict.blocked:
+            raise CertiorBlocked(output_verdict)
+
+    return result
+```
+
+The input gate covers Threats 1, 3, 5, and 6 (prompt injection, unauthorised capability access, resource exhaustion, and command injection). The output gate covers Threats 4 and 7 (data exfiltration and tool result tampering).
+
+## Multi-step delegation with GuardedPipeline
+
+For workflows that chain multiple OpenClaw agents, use `GuardedPipeline`. It checks each step's declared capability set against the parent guard's permissions **at registration time** — a step that asks for capabilities the parent doesn't hold is rejected before the pipeline runs.
+
+```python
+from certior.adapters.openclaw import GuardedPipeline, CertiorCallbackHandler
+from openclaw_sdk.pipeline import Pipeline
+
+guard = Guard(
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+)
+
+async with OpenClawClient.connect(
+    callbacks=[CertiorCallbackHandler(guard)],   # budget + content per step
+) as client:
+    pipeline = GuardedPipeline(
+        Pipeline(client),
+        guard,
+        step_capabilities={
+            "researcher": ["network:http:read"],   # ⊆ parent permissions ✓
+            "summariser": ["filesystem:read"],      # ⊆ parent permissions ✓
+            # "exfiltrator": ["database:admin"],   # ✗ — raises CertiorBlocked at add_step
+        },
+    )
+    pipeline.add_step("researcher", "research-bot", "find recent AI safety papers")
+    pipeline.add_step("summariser", "writer-bot",   "summarise the findings")
+    output = await pipeline.run()
+```
+
+`GuardedPipeline.run()` delegates straight to the underlying pipeline. Per-step budget and content gates are handled by `CertiorCallbackHandler` via OpenClaw's `on_execution_start` and `on_execution_end` hooks — do not use `GuardedPipeline` without the callback handler, or per-step budget and content checking won't run.
+
+## Threat mapping
+
+The table below maps each threat from the OpenClaw security paper (arXiv:2603.12644) to the Certior gate that addresses it and the surface that runs the check at request time.
+
+| # | Threat | Gate | Surface | What runs |
+|:--:|---|---|---|---|
+| 1 | Prompt Injection | Content (input) | `CertiorCallbackHandler` + `GuardedAgent` | Keyword + regex against the policy's `blocked_patterns` |
+| 2 | ClawDrain — tool-chain exploitation | Delegation | `GuardedPipeline` | Per-step `step_caps ⊆ parent_permissions` at `add_step` |
+| 3 | Unauthorised Capability Access | Capability | `GuardedAgent` | `required_capabilities ⊆ permissions`; Z3 proves the subset |
+| 4 | Data Exfiltration | Content (output) | `GuardedAgent` + `CertiorCallbackHandler` | PII detector on `ExecutionResult.content`; redact under HIPAA |
+| 5 | Resource Exhaustion | Budget | `CertiorCallbackHandler` | `cost_cents` debited per execution and per pipeline step |
+| 6 | Command Injection | Content (params) | `GuardedAgent` | Parameters scanned with same rules as prompt content |
+| 7 | Tool Result Tampering | Content (output) | `GuardedAgent` | Output gate re-verifies `ExecutionResult` before returning to caller |
+| 8 | Privilege Escalation via Tool Chains | Composition | `GuardedPipeline` | Independent per-step verdicts; `compositionSoundness` theorem governs |
+
+All eight threats enumerated in the paper are addressed by gates present in Certior 0.5.0.
+
+## Pre-install skill auditing with certior-skill-audit
+
+Before installing a third-party OpenClaw skill into your environment, use the static skill auditor to extract its declared capability set and check it against your policy. The auditor reads the `metadata.certior.capabilities` extension field from a skill's `SKILL.md` frontmatter.
+
+**Annotate your SKILL.md** with the certior extension:
+
+```yaml
+---
+name: image-lab
+description: Generate or edit images via a provider-backed workflow
+metadata:
+  openclaw:
+    requires: { env: ["GEMINI_API_KEY"] }
+  certior:
+    capabilities: ["network:http:read", "filesystem:write"]
+---
+```
+
+**Audit a single skill programmatically:**
+
+```python
+from certior.adapters.openclaw import audit_skill, load_step_capabilities_from_skill
+
+# Load the capability set declared by the skill
+caps = load_step_capabilities_from_skill("~/.openclaw/workspace/skills/image-lab/SKILL.md")
+print(caps)   # ["network:http:read", "filesystem:write"]
+
+# Full audit — returns a SkillAuditResult with fingerprint and capability list
+result = audit_skill("~/.openclaw/workspace/skills/image-lab/SKILL.md")
+print(result.name)          # "image-lab"
+print(result.capabilities)  # ["network:http:read", "filesystem:write"]
+print(result.fingerprint)   # sha256 of the SKILL.md content, for change detection
+```
+
+**Audit an entire skills directory:**
+
+```python
+from certior.adapters.openclaw import audit_skills_dir, load_step_capabilities_from_skills_dir
+
+# Load all capability maps for use in GuardedPipeline
+step_caps = load_step_capabilities_from_skills_dir(
+    "~/.openclaw/workspace/skills/",
+    step_name_from="name",   # use the frontmatter `name` field as the key
+)
+# {"image-lab": ["network:http:read", "filesystem:write"], ...}
+
+pipeline = GuardedPipeline(Pipeline(client), guard, step_capabilities=step_caps)
+```
+
+<Note>
+If a `SKILL.md` has no `metadata.certior.capabilities` field, `load_step_capabilities_from_skill` returns an empty list and logs a warning. Certior does not invent capabilities from heuristics like `requires.bins` — skill authors must declare the capability set explicitly, or the skill runs with the most restrictive set.
+</Note>
+
+## Complete example
+
+```python
+import asyncio
+from certior import Guard, CertiorBlocked
+from certior.adapters.openclaw import (
+    GuardedAgent,
+    CertiorCallbackHandler,
+    GuardedPipeline,
+    load_step_capabilities_from_skills_dir,
+)
+from openclaw_sdk import OpenClawClient
+from openclaw_sdk.pipeline import Pipeline
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    agent_id="clinical-research-pipeline",
+)
+
+async def run():
+    # Load declared capabilities from installed skills
+    step_caps = load_step_capabilities_from_skills_dir(
+        "~/.openclaw/workspace/skills/",
+    )
+
+    async with OpenClawClient.connect(
+        callbacks=[CertiorCallbackHandler(guard)],
+    ) as client:
+        # Single agent with enforcement
+        agent = GuardedAgent(client.get_agent("literature-bot"), guard)
+
+        try:
+            result = await agent.execute("Summarise recent papers on MRSA treatment")
+            print(result.content)
+        except CertiorBlocked as e:
+            print(f"Blocked: {e.result.reason}")
+
+        # Multi-step pipeline
+        pipeline = GuardedPipeline(
+            Pipeline(client),
+            guard,
+            step_capabilities=step_caps,
+        )
+        pipeline.add_step("literature-bot", "literature-bot", "find papers")
+        pipeline.add_step("summary-bot",    "writer-bot",     "write summary")
+        output = await pipeline.run()
+        print(output)
+
+    print(f"Budget remaining: {guard.budget_remaining}¢")
+    print(f"Audit entries: {len(guard.audit_log)}")
+
+asyncio.run(run())
+```
+
+## Policy attestation
+
+Every verdict's certificate carries the same Lean policy fingerprint. You can inspect the provenance of the policy this guard enforces and re-run the audit yourself:
+
+```python
+print(guard.policy_attestation)
+# {
+#   'kernel':    'Certior.Lattice + Delegation + Encoding + Composition (Lean 4)',
+#   'fingerprint': '4542ff75cfe3aec7',
+#   'audited_guarantees': [
+#       'Certior.Delegation.delegationSafety',
+#       'Certior.Encoding.ifcSoundness',
+#       'Certior.Composition.compositionSoundness',
+#       'SecurityLevel.isValidBoundedLattice',
+#   ],
+#   'trusted_axioms': ['propext', 'Classical.choice', 'Quot.sound'],
+#   'audit_command': 'cd lean4/CertiorLattice && lake build Certior.Audit',
+# }
+```
+
+The `audit_command` field contains the exact command an auditor can run to independently verify that all four headline theorems depend only on Lean's standard axioms with no `sorry` or hidden assumptions.

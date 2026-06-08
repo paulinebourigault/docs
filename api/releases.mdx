@@ -1,0 +1,405 @@
+---
+title: "Certior Releases API — Decisions, Promotions & Trust"
+sidebarTitle: "Releases"
+description: "Query release readiness decisions, record audit-grade promotions, receive GitHub webhook events, and embed SVG trust badges in your repository README."
+---
+
+The releases API connects Certior's formal verification graph to your CI/CD pipeline. You query a repository and optional commit SHA to get a `SHIP` or `NO_SHIP` decision backed by the verification evidence in the graph. When a decision is ready to ship, an `admin` or `approver` records an audit-grade promotion that permanently binds the reviewer's identity, artifact digest, and reason to the snapshot. A GitHub webhook receiver posts the decision directly to pull request comments, and the trust badge endpoint returns an embeddable SVG for your README.
+
+<Note>
+The releases endpoints require a configured verification graph database on the server. If that connection is unavailable, all releases endpoints return `500`.
+</Note>
+
+---
+
+## GET /api/v1/releases/decision
+
+Get the canonical release readiness decision for a repository and optional commit. This is the primary deployment gate endpoint — integrate it into your CI pipeline to block deploys when the decision is `NO_SHIP`.
+
+**Requires authentication.** All authenticated roles may use this endpoint. Returns `200 OK`.
+
+### Query Parameters
+
+<ParamField query="repo_root" type="string" required>
+  Repository root or git origin URL. Example: `"https://github.com/your-org/your-repo"`.
+</ParamField>
+
+<ParamField query="commit_sha" type="string">
+  Optional specific commit SHA to evaluate. When omitted, the latest ingested snapshot for the repository is used.
+</ParamField>
+
+<ParamField query="release_artifact_digest" type="string">
+  Optional SHA-256 digest of the release artifact. Included verbatim in the response for binding purposes.
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="decision" type="string">
+  The overall release determination. One of `"SHIP"` or `"NO_SHIP"`. Any external gate should deploy only when this equals `"SHIP"`.
+</ResponseField>
+
+<ResponseField name="repo_root" type="string">
+  The repository root that was evaluated.
+</ResponseField>
+
+<ResponseField name="commit_sha" type="string">
+  The specific commit SHA that was evaluated, or `null` if not supplied.
+</ResponseField>
+
+<ResponseField name="release_artifact_digest" type="string">
+  The artifact digest supplied in the request, or `null` if not supplied.
+</ResponseField>
+
+<ResponseField name="blockers" type="array of objects">
+  Hard blockers preventing release. Present only when `decision` is `"NO_SHIP"`.
+
+  <Expandable title="Blocker fields">
+    <ResponseField name="component" type="string">
+      The subsystem or manifest item that owns the failure.
+    </ResponseField>
+
+    <ResponseField name="reason" type="string">
+      Human-readable reason for the block.
+    </ResponseField>
+
+    <ResponseField name="remediation_suggestion" type="string">
+      Suggested action to resolve the blocker.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="explanation" type="array of objects">
+  Per-policy evaluation results — one entry per policy rule checked.
+
+  <Expandable title="Explanation item fields">
+    <ResponseField name="policy" type="string">
+      The policy code or identifier.
+    </ResponseField>
+
+    <ResponseField name="requirement" type="string">
+      Human-readable description of the policy condition.
+    </ResponseField>
+
+    <ResponseField name="satisfied" type="boolean">
+      `true` if the release satisfies this policy requirement.
+    </ResponseField>
+
+    <ResponseField name="evidence_id" type="string">
+      Graph evidence ID, if applicable.
+    </ResponseField>
+
+    <ResponseField name="remediation" type="string">
+      Suggested remediation if the requirement was not satisfied.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="provenance" type="object">
+  Evidence provenance for the decision.
+
+  <Expandable title="Provenance fields">
+    <ResponseField name="components" type="array of objects">
+      List of components with `name`, `version`, and `source_commit`.
+    </ResponseField>
+
+    <ResponseField name="checks" type="array of objects">
+      CI check run summaries with `workflow`, `check_run_name`, `conclusion`, and `url`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="baseline" type="object">
+  Comparison against the last successfully attested snapshot.
+
+  <Expandable title="Baseline comparison fields">
+    <ResponseField name="has_baseline" type="boolean">
+      `true` if a prior attested snapshot was found for comparison.
+    </ResponseField>
+
+    <ResponseField name="baseline_commit_sha" type="string">
+      Commit SHA of the baseline snapshot.
+    </ResponseField>
+
+    <ResponseField name="components" type="object">
+      Inventory change summary for components: `current_count`, `baseline_count`, `delta`, `added`, `removed`.
+    </ResponseField>
+
+    <ResponseField name="verified_properties" type="object">
+      Inventory change summary for verified properties: `current_count`, `baseline_count`, `delta`, `added`, `removed`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash Query release decision
+curl "https://<host>/api/v1/releases/decision?repo_root=https://github.com/your-org/your-repo&commit_sha=abc123def456" \
+  -H "Authorization: Bearer ck-your-key"
+```
+
+```json SHIP response
+{
+  "decision": "SHIP",
+  "repo_root": "https://github.com/your-org/your-repo",
+  "commit_sha": "abc123def456",
+  "release_artifact_digest": null,
+  "blockers": [],
+  "explanation": [
+    {
+      "policy": "VERIFIED_COMPONENT_COVERAGE",
+      "requirement": "All components must have verified properties on record",
+      "satisfied": true,
+      "evidence_id": "ev-9a8b7c6d",
+      "remediation": null
+    }
+  ],
+  "provenance": {
+    "components": [
+      { "name": "agent-core", "version": "1.2.3", "source_commit": "abc123def456" }
+    ],
+    "checks": [
+      {
+        "workflow": "certior-verify",
+        "check_run_name": "Formal Verification",
+        "conclusion": "success",
+        "url": "https://github.com/your-org/your-repo/actions/runs/12345"
+      }
+    ]
+  },
+  "baseline": {
+    "has_baseline": true,
+    "baseline_commit_sha": "prev789commit",
+    "components": {
+      "current_count": 5,
+      "baseline_count": 5,
+      "delta": 0,
+      "added": [],
+      "removed": []
+    },
+    "verified_properties": {
+      "current_count": 12,
+      "baseline_count": 11,
+      "delta": 1,
+      "added": ["information_flow: proven"],
+      "removed": []
+    }
+  }
+}
+```
+
+```json NO_SHIP response
+{
+  "decision": "NO_SHIP",
+  "repo_root": "https://github.com/your-org/your-repo",
+  "commit_sha": "abc123def456",
+  "blockers": [
+    {
+      "component": "agent-core",
+      "reason": "Missing required verified property: information_flow",
+      "remediation_suggestion": "Run the Certior verification workflow on the latest commit and ensure all tools pass the IFC gate."
+    }
+  ],
+  "explanation": [
+    {
+      "policy": "INFORMATION_FLOW_VERIFIED",
+      "requirement": "All tool calls must have information-flow proof certificates",
+      "satisfied": false,
+      "remediation": "Run the Certior verification workflow on the latest commit."
+    }
+  ],
+  "baseline": { "has_baseline": false }
+}
+```
+</CodeGroup>
+
+---
+
+## GET /api/v1/releases/health
+
+Surface ingest health and evidence freshness separately from policy decisions. Use this to diagnose why evidence is missing before querying for a release decision.
+
+**Requires authentication.** Returns `200 OK`.
+
+### Query Parameters
+
+<ParamField query="repo_root" type="string" required>
+  Repository root or git origin URL.
+</ParamField>
+
+<ParamField query="commit_sha" type="string">
+  Optional specific commit SHA.
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="repo_root" type="string">
+  The repository root that was evaluated.
+</ResponseField>
+
+<ResponseField name="commit_sha" type="string">
+  The commit SHA evaluated.
+</ResponseField>
+
+<ResponseField name="ingest_status" type="string">
+  Overall ingest health: `"healthy"`, `"degraded"`, or `"failed"`.
+</ResponseField>
+
+<ResponseField name="ingest_issues" type="array of objects">
+  Detailed issue records with `health_state`, `severity`, `code`, `detail`, `component_name`, and `property_key`.
+</ResponseField>
+
+<ResponseField name="freshness_summary" type="object">
+  Evidence freshness counts by state.
+</ResponseField>
+
+---
+
+## POST /api/v1/releases/promote
+
+Record an audit-grade promotion or rejection decision. This permanently binds the reviewer's verified identity, artifact digest, reason, and timestamp to the snapshot. Only users with the `admin` or `approver` role may call this endpoint.
+
+**Requires authentication with `admin` or `approver` role.** Returns `200 OK`.
+
+<Warning>
+The promotion record uses the authenticated user's identity (email or user ID) as the authoritative operator identity. The `operator_identity` field you supply is stored alongside it for additional context but does not override the verified caller identity.
+</Warning>
+
+### Request Body
+
+<ParamField body="repo_root" type="string" required>
+  Repository root or git origin URL.
+</ParamField>
+
+<ParamField body="operator_identity" type="string" required>
+  Email address, badge ID, or username of the reviewer. Stored in the promotion record as supplementary context. The authoritative actor identity is always derived from your authenticated API credentials.
+</ParamField>
+
+<ParamField body="reason" type="string" required>
+  Explanation for the approval or rejection decision. Stored immutably in the promotion record.
+</ParamField>
+
+<ParamField body="bound_artifact_digest" type="string" required>
+  SHA-256 digest of the release artifact. Cryptographically binds this promotion to a specific build artifact.
+</ParamField>
+
+<ParamField body="commit_sha" type="string">
+  Optional specific commit SHA to promote.
+</ParamField>
+
+<ParamField body="status" type="string" default="attested">
+  Promotion outcome. Use `"attested"` for approval, `"rejected"` to halt the release, or `"revoked"` to reverse a prior approval.
+</ParamField>
+
+<ParamField body="release_label" type="string">
+  Optional tag or label, e.g. `"v1.2.3"`.
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="tool" type="string">
+  The graph tool that processed the promotion.
+</ResponseField>
+
+<ResponseField name="snapshot" type="object">
+  The snapshot record that was promoted.
+</ResponseField>
+
+<ResponseField name="promotion" type="object">
+  The created promotion record, or `null` if no promotion was persisted.
+</ResponseField>
+
+```bash
+curl -X POST https://<host>/api/v1/releases/promote \
+  -H "Authorization: Bearer ck-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_root": "https://github.com/your-org/your-repo",
+    "operator_identity": "alice@example.com",
+    "reason": "All HIPAA proofs satisfied. Approved for production.",
+    "bound_artifact_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4...",
+    "commit_sha": "abc123def456",
+    "status": "attested",
+    "release_label": "v1.2.3"
+  }'
+```
+
+---
+
+## GET /api/v1/releases/promotions
+
+List the promotion history for a repository. All authenticated roles may view this list.
+
+**Requires authentication.** Returns `200 OK`.
+
+### Query Parameters
+
+<ParamField query="repo_root" type="string" required>
+  Repository root to filter by.
+</ParamField>
+
+<ParamField query="commit_sha" type="string">
+  Optional specific commit SHA to filter by.
+</ParamField>
+
+---
+
+## POST /api/v1/releases/github-webhook
+
+Receive GitHub pull-request webhook payloads. When a PR is opened, synchronized, or reopened, Certior evaluates the release decision for the head commit and posts a trust comment to the PR. Configure this URL as a webhook in your repository settings.
+
+**No authentication required.** Returns `200 OK` with a JSON status object.
+
+Certior uses the `GITHUB_TOKEN` environment variable on the server to post comments. If that variable is not set, the decision is evaluated but no comment is posted.
+
+```json
+{
+  "status": "processed",
+  "decision": "SHIP",
+  "blockers": 0
+}
+```
+
+Events that are not pull-request events return:
+```json
+{ "status": "ignored", "reason": "not a pull_request event" }
+```
+
+---
+
+## GET /api/v1/trust/badge
+
+Return an SVG badge suitable for embedding in a repository README. The badge shows `"Assured"` in green when the latest snapshot is attested, or `"Blocked"` in red when it is not. Falls back to a grey `"Unknown"` badge when the verification graph cannot be reached.
+
+**No authentication required.** Returns `200 OK` with `Content-Type: image/svg+xml`.
+
+### Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository root or git origin URL.
+</ParamField>
+
+<ParamField query="commit" type="string">
+  Optional specific commit SHA.
+</ParamField>
+
+```bash
+curl "https://<host>/api/v1/trust/badge?repo=https://github.com/your-org/your-repo"
+```
+
+Embed it in your README:
+
+```markdown
+![Certior Trust](https://your-certior-host/api/v1/trust/badge?repo=https://github.com/your-org/your-repo)
+```
+
+---
+
+## Compatibility Guarantees
+
+The releases API is part of the `v1` surface and is governed by the same backward-compatibility contract as all other Certior endpoints:
+
+- The `decision` field will always be exactly `"SHIP"` or `"NO_SHIP"` — these strings will not change.
+- Fields in the `ReleaseDecisionResponse`, blocker items, and explanation items will not be removed or have their types changed.
+- New optional fields may be added in minor releases. Your client must silently ignore unknown fields.
+- If a breaking change becomes unavoidable, Certior introduces `/api/v2/releases/...`, marks the `v1` path deprecated, and maintains it for a **minimum of six months** with published migration notes before removal.

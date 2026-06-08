@@ -1,0 +1,85 @@
+---
+title: "Certior: Provable Boundaries for AI Agent Tool Calls"
+sidebarTitle: "Introduction"
+description: "Learn how Certior's three-gate model and Lean 4 proof kernel give your AI agents formally verified safety boundaries — not just best-effort guardrails."
+---
+
+When an AI agent calls a tool, you want to know that the call was allowed by a policy you control, that no sensitive data leaked through, and that the agent didn't overspend its budget. Today, most teams handle this with prompts, runtime checks, and hope. Certior replaces that with a formally verified boundary: three gates that run before every tool call, a Z3 solver that checks each action against the policy, and a signed certificate you can hand to an auditor. If the call is blocked, you get a precise reason. If it's allowed, you have a proof.
+
+## The problem Certior solves
+
+Large language models are powerful but non-deterministic. A prompt that says "don't call `db_admin_drop`" is not a security boundary — it is a suggestion. The same is true for any purely prompt-based guardrail: an adversarial input, a confused-deputy attack, or a subtle misunderstanding in the model's context can cause the agent to call tools it was never meant to reach, exfiltrate PII through an output field, or exhaust a budget in a single runaway loop.
+
+Certior sits between the model's output and your executor. It is not a prompt. It is a policy enforcer with a machine-verified proof of soundness. If the model asks for something the policy forbids, the call never reaches your tool.
+
+## The three gates
+
+Every call through `guard.verify()` or `@guard.wrap()` passes through three gates in sequence. All three must pass before the call is allowed.
+
+### Capability gate
+
+The Capability gate answers: *does this agent have permission to use this tool?*
+
+You declare a set of capability strings when you create a `Guard` — for example `["network:http:read", "filesystem:read"]`. Each tool declares the capabilities it requires. The gate uses a Z3 SMT solver to formally prove that the required capabilities are a subset of the granted ones. If the agent tries to call a tool that needs `filesystem:write` but was only granted `filesystem:read`, the gate blocks it immediately and tells you exactly which capability was missing.
+
+This means privilege escalation — where a sub-agent tries to use a capability its parent never granted — is caught at the boundary, not discovered in post-incident review.
+
+### Content gate
+
+The Content gate answers: *does this call contain data that violates the active policy?*
+
+Certior scans the tool's input parameters and any attached content for PII, PHI, MNPI, attorney-client privileged material, or other categories defined by the active compliance policy. When a violation is found, the call is blocked and the matched text is reported. When the policy allows redaction (as `hipaa` and `sox` do by default), Certior automatically replaces sensitive fields with safe placeholders and returns the cleaned version in `result.redacted_params` — so your tools can still run on sanitised data.
+
+### Budget gate
+
+The Budget gate answers: *can this agent afford this call?*
+
+You set a `budget_cents` ceiling when you create a `Guard`. Each tool declares a `cost_cents`. Certior maintains a running ledger and deducts the cost only when a call passes all three gates. If a call would exceed the remaining balance, it is blocked before it runs. The ceiling is a hard limit enforced by Z3, not a soft warning — a runaway agent loop cannot spend past it.
+
+## Signed certificates and audit trails
+
+When a call passes all three gates and Z3 formally verifies it, Certior issues a signed **certificate**. Each certificate contains:
+
+- The tool name and the agent ID
+- The exact set of required capabilities that were checked
+- The Z3 proof trace and solve time
+- A **Lean policy fingerprint** — a short SHA that uniquely identifies the version of the policy model that was in force
+
+You persist these certificates in your `audit_log`. Later, an auditor can take any certificate, look up the fingerprint in the repository, and independently verify that the policy was sound at the time the call was made. The certificate is plan-bound: a SHA-256 of the action content is embedded, so any tampering with the recorded call invalidates the receipt.
+
+<Note>
+  Calls that pass through the wildcard permission `"*"` or that carry no capability or cost metadata are still checked for content safety, but do not produce a certificate — Certior only signs what is actually proven by Z3.
+</Note>
+
+## The Lean 4 proof model
+
+The Z3 solver that runs on every call enforces a *policy model* — a set of rules about how capabilities compose, how delegation works, and how information flow is controlled. That model is machine-checked in **Lean 4**, one of the most rigorous proof assistants available.
+
+What this means for you: Certior's policy model currently covers **155 theorems with 0 `sorry` and 0 untrusted axioms** (only Lean's standard three: `propext`, `Classical.choice`, and `Quot.sound`). The four top-level guarantees that every gate relies on are:
+
+| Guarantee | What it means |
+|---|---|
+| `delegationSafety` | A child agent can never hold capabilities its parent didn't grant |
+| `ifcSoundness` | Information-flow control rules are enforced at every boundary |
+| `compositionSoundness` | Composed policies are at least as restrictive as their components |
+| `isValidBoundedLattice` | The capability lattice is well-formed and admits no privilege escalation |
+
+CI fails the build if any guarantee stops depending only on those three standard axioms. A regression in the proof is caught at commit time, not in production.
+
+You don't need to know Lean to use Certior. The value to you is that when you run `pip install certior`, you get a safety boundary whose rules are not opinions or heuristics — they are theorems.
+
+## What Certior does not claim
+
+Certior verifies the **boundary** the agent operates inside. It does not verify the LLM's behaviour, the correctness of your prompts, or the logic of your tools. If an action violates the policy, it is provably blocked. What happens inside the tools that pass is yours to own.
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    See Certior in action in five minutes with a basic Guard and your first blocked call.
+  </Card>
+  <Card title="OpenAI Guide" icon="wand-magic-sparkles" href="/quickstart-openai">
+    Add `verify_tool_calls()` to your existing OpenAI tool-calling loop.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for Guard, VerifyResult, Policy, and all adapters.
+  </Card>
+</CardGroup>

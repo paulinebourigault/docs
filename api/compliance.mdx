@@ -1,0 +1,350 @@
+---
+title: "Certior Compliance API — Audit Packages & Presets"
+sidebarTitle: "Compliance"
+description: "Export audit packages for completed executions: proof certificate chains, Z3 traces, Lean flow proofs, and a machine-readable compliance attestation."
+---
+
+After a task execution completes, every verification step has been recorded in an immutable audit trail. The compliance endpoints let you package that evidence into a structured artifact you can hand to an auditor, archive for the required retention period, or attach to a regulatory submission. You can export in JSON format for programmatic processing or as a downloadable PDF for human review. You can also list the available compliance presets to discover which policies are registered on the server.
+
+## GET /api/v1/compliance/presets
+
+Return the list of available compliance presets. This endpoint is **public** — no authentication required.
+
+```bash
+curl https://<host>/api/v1/compliance/presets
+```
+
+```json
+[
+  {
+    "name": "HIPAA",
+    "key": "hipaa",
+    "required_proofs": ["no_phi_external_flow", "minimum_necessary_access", "authorized_user_only"],
+    "human_approvals": ["send_external_communication", "export_patient_data", "data_export"],
+    "retention_days": 2190
+  },
+  {
+    "name": "SOX",
+    "key": "sox",
+    "required_proofs": ["no_mnpi_leak", "segregation_of_duties", "authorized_access_only"],
+    "human_approvals": ["send_external_communication", "modify_financial_records"],
+    "retention_days": 2555
+  },
+  {
+    "name": "Legal Privilege",
+    "key": "legal_privilege",
+    "required_proofs": ["no_privilege_waiver", "client_authorized"],
+    "human_approvals": ["send_email", "external_communication", "document_sharing"],
+    "retention_days": 3650
+  },
+  {
+    "name": "Default",
+    "key": "default",
+    "required_proofs": [],
+    "human_approvals": [],
+    "retention_days": 365
+  }
+]
+```
+
+---
+
+## GET /api/v1/compliance/{execution_id}/export
+
+Export the compliance audit package for a completed execution. Returns either a JSON payload or a downloadable PDF depending on the `format` parameter.
+
+**Requires authentication.** Returns `200 OK`.
+
+### Path Parameters
+
+<ParamField path="execution_id" type="string" required>
+  The UUID of the execution to export.
+</ParamField>
+
+### Query Parameters
+
+<ParamField query="preset" type="string">
+  Compliance preset to apply when building the audit package. Accepted values: `hipaa`, `sox`, `legal_privilege`, `default`. When omitted, Certior infers the preset from the execution's original compliance policy.
+</ParamField>
+
+<ParamField query="format" type="string" default="json">
+  Export format. Use `json` for a structured JSON response (default) or `pdf` for a downloadable PDF audit report. PDF export requires the `reportlab` Python package to be installed on the server.
+</ParamField>
+
+### Response Fields (JSON format)
+
+<ResponseField name="package_id" type="string">
+  A unique UUID for this export artifact. Use this to correlate the package with other records.
+</ResponseField>
+
+<ResponseField name="generated_at" type="number">
+  Unix timestamp when the package was generated.
+</ResponseField>
+
+<ResponseField name="compliance_regime" type="string">
+  The name of the compliance preset applied, e.g. `"HIPAA"`.
+</ResponseField>
+
+<ResponseField name="execution_summary" type="object">
+  Key metadata about the execution.
+
+  <Expandable title="execution_summary fields">
+    <ResponseField name="execution_id" type="string">
+      The execution UUID.
+    </ResponseField>
+
+    <ResponseField name="task" type="string">
+      The original task description.
+    </ResponseField>
+
+    <ResponseField name="user_id" type="string">
+      The user who submitted the task.
+    </ResponseField>
+
+    <ResponseField name="status" type="string">
+      Terminal status of the execution.
+    </ResponseField>
+
+    <ResponseField name="created_at" type="number">
+      Unix timestamp of creation.
+    </ResponseField>
+
+    <ResponseField name="completed_at" type="number">
+      Unix timestamp of completion.
+    </ResponseField>
+
+    <ResponseField name="cost_cents" type="integer">
+      Total execution cost in US cents.
+    </ResponseField>
+
+    <ResponseField name="certificate_count" type="integer">
+      Number of proof certificates issued.
+    </ResponseField>
+
+    <ResponseField name="output_preview" type="string">
+      First 2,000 characters of the agent's output.
+    </ResponseField>
+
+    <ResponseField name="verification_profile" type="object">
+      The task-adaptive verification profile applied to the execution.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="certificates" type="array of objects">
+  Proof certificates emitted during verified execution. Each certificate records the prover engine and the set of verified properties.
+
+  <Expandable title="Certificate fields">
+    <ResponseField name="id" type="string">
+      Certificate identifier.
+    </ResponseField>
+
+    <ResponseField name="type" type="string">
+      Certificate type: `proof_certificate`, `lean_flow_certificate`, `dafny_proof_certificate`, `seccomp_compliance_certificate`, or `runtime_verification`.
+    </ResponseField>
+
+    <ResponseField name="prover" type="string">
+      The formal prover that issued this certificate: `z3`, `lean4`, `z3+lean4`, `dafny`, or `dafny+runtime`.
+    </ResponseField>
+
+    <ResponseField name="verified_properties" type="array of strings">
+      List of formally verified properties, e.g. `["information_flow: proven", "capability_coverage: proven"]`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="safety_scans" type="array of objects">
+  Content safety scan results. Each entry records the phase (input or output), violation counts, PII detections, and secret detections per tool step.
+</ResponseField>
+
+<ResponseField name="flow_analysis" type="object">
+  Information-flow analysis summary.
+
+  <Expandable title="flow_analysis fields">
+    <ResponseField name="rules_enforced" type="integer">
+      Number of information-flow rules enforced by the compliance preset.
+    </ResponseField>
+
+    <ResponseField name="flows_tracked" type="integer">
+      Total information flows observed during execution.
+    </ResponseField>
+
+    <ResponseField name="violations_detected" type="integer">
+      Number of flow violations blocked during execution.
+    </ResponseField>
+
+    <ResponseField name="violation_details" type="array of objects">
+      Detailed records for each detected violation.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="verification_runtime" type="object">
+  Summary of which formal verification engines were active during execution.
+
+  <Expandable title="verification_runtime fields">
+    <ResponseField name="lean_status" type="string">
+      `"active"`, `"unavailable"`, or `"unknown"`.
+    </ResponseField>
+
+    <ResponseField name="mode" type="string">
+      `"dual_proof"` (Lean 4 + Z3) or `"z3_only"` (Lean kernel unavailable).
+    </ResponseField>
+
+    <ResponseField name="steps_checked" type="integer">
+      Number of steps verified by the Lean kernel.
+    </ResponseField>
+
+    <ResponseField name="certificates_issued" type="integer">
+      Certificates issued by the Lean kernel.
+    </ResponseField>
+
+    <ResponseField name="flow_violations" type="integer">
+      Information-flow violations detected by Lean.
+    </ResponseField>
+
+    <ResponseField name="avg_latency_ms" type="number">
+      Average Lean verification latency per step in milliseconds.
+    </ResponseField>
+
+    <ResponseField name="detail" type="string">
+      Human-readable summary of verification runtime status.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="policy_applied" type="object">
+  The full compliance policy configuration that was applied, including permissions, forbidden permissions, flow rules, audit configuration, required proofs, and human approval gates.
+</ResponseField>
+
+<ResponseField name="audit_trail" type="array of objects">
+  Ordered list of audit events. Each entry records the timestamp, actor, action, resource, result, and full detail payload.
+</ResponseField>
+
+<ResponseField name="attestation" type="object">
+  Machine-readable compliance attestation.
+
+  <Expandable title="attestation fields">
+    <ResponseField name="regime" type="string">
+      The compliance regime name.
+    </ResponseField>
+
+    <ResponseField name="retention_days" type="integer">
+      Required audit trail retention period in days.
+    </ResponseField>
+
+    <ResponseField name="proofs_required" type="array of strings">
+      Proofs that must be satisfied for compliance.
+    </ResponseField>
+
+    <ResponseField name="proofs_satisfied" type="array of strings">
+      Required proofs that were actually satisfied.
+    </ResponseField>
+
+    <ResponseField name="proofs_missing" type="array of strings">
+      Required proofs that were not satisfied. Empty for a fully compliant execution.
+    </ResponseField>
+
+    <ResponseField name="human_approvals_required" type="array of strings">
+      Human approval gates required by the policy.
+    </ResponseField>
+
+    <ResponseField name="certificate_count" type="integer">
+      Total proof certificates in this package.
+    </ResponseField>
+
+    <ResponseField name="verified_properties" type="array of strings">
+      Deduplicated set of all verified properties across all certificates.
+    </ResponseField>
+
+    <ResponseField name="compliant" type="boolean">
+      `true` if all required proofs are satisfied. Use this field as your programmatic compliance gate.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example: HIPAA Export
+
+<CodeGroup>
+```bash Export JSON
+curl "https://<host>/api/v1/compliance/9d7e4f2a-.../export?preset=hipaa&format=json" \
+  -H "Authorization: Bearer ck-your-key"
+```
+
+```bash Export PDF
+curl "https://<host>/api/v1/compliance/9d7e4f2a-.../export?preset=hipaa&format=pdf" \
+  -H "Authorization: Bearer ck-your-key" \
+  --output certior-audit-hipaa.pdf
+```
+</CodeGroup>
+
+```json Sample JSON package (condensed)
+{
+  "package_id": "e4f5g6h7-8i9j-...",
+  "generated_at": 1718000010.0,
+  "compliance_regime": "HIPAA",
+  "execution_summary": {
+    "execution_id": "9d7e4f2a-...",
+    "task": "Summarize a patient encounter into a discharge summary. Redact all direct identifiers.",
+    "status": "completed",
+    "certificate_count": 3,
+    "output_preview": "DISCHARGE SUMMARY\n[redacted]..."
+  },
+  "certificates": [
+    {
+      "id": "cert-a1b2c3d4",
+      "type": "proof_certificate",
+      "prover": "z3+lean4",
+      "verified_properties": ["information_flow: proven", "capability_coverage: proven"]
+    },
+    {
+      "id": "lean-9d7e4f2a",
+      "type": "lean_flow_certificate",
+      "prover": "lean4",
+      "verified_properties": ["information_flow: proven"]
+    }
+  ],
+  "flow_analysis": {
+    "rules_enforced": 2,
+    "flows_tracked": 5,
+    "violations_detected": 0
+  },
+  "verification_runtime": {
+    "lean_status": "active",
+    "mode": "dual_proof",
+    "steps_checked": 3,
+    "certificates_issued": 2,
+    "flow_violations": 0,
+    "avg_latency_ms": 2.4,
+    "detail": "Lean kernel active in dual-proof mode with 3 flow check(s)."
+  },
+  "attestation": {
+    "regime": "HIPAA",
+    "retention_days": 2190,
+    "proofs_required": ["no_phi_external_flow", "minimum_necessary_access", "authorized_user_only"],
+    "proofs_satisfied": ["no_phi_external_flow", "minimum_necessary_access", "authorized_user_only"],
+    "proofs_missing": [],
+    "human_approvals_required": ["send_external_communication", "export_patient_data", "data_export"],
+    "certificate_count": 3,
+    "verified_properties": [
+      "budget_sufficient: proven",
+      "capability_coverage: proven",
+      "information_flow: proven"
+    ],
+    "compliant": true
+  }
+}
+```
+
+<Note>
+The `attestation.compliant` field is your programmatic compliance gate. A value of `true` means every required proof for the selected preset was satisfied. A value of `false` means at least one required proof is listed in `proofs_missing` — review those and the `verification_runtime` block to understand why.
+</Note>
+
+## Compliance Preset Quick Reference
+
+| Preset key | Regime | Required proofs | Retention |
+|------------|--------|----------------|-----------|
+| `hipaa` | HIPAA | `no_phi_external_flow`, `minimum_necessary_access`, `authorized_user_only` | 6 years (2 190 days) |
+| `sox` | SOX | `no_mnpi_leak`, `segregation_of_duties`, `authorized_access_only` | 7 years (2 555 days) |
+| `legal_privilege` | Attorney-Client Privilege | `no_privilege_waiver`, `client_authorized` | 10 years (3 650 days) |
+| `default` | None | — | 1 year (365 days) |

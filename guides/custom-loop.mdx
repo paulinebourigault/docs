@@ -1,0 +1,376 @@
+---
+title: "Certior Verification in a Custom Agent Orchestration Loop"
+sidebarTitle: "Custom Loop"
+description: "Use Guard.verify(), Guard.wrap(), or CertiorMiddleware to add formally verified capability, content, and budget gates to any agent loop you already own."
+---
+
+If you run your own agent orchestration loop — whether it's a hand-rolled async dispatcher, a proprietary tool router, or a framework that Certior doesn't ship an adapter for — you don't need to change how your loop is structured. Certior exposes three integration surfaces that sit at different abstraction levels. You pick the one that fits your existing code shape and the rest of your loop stays unchanged.
+
+## Install
+
+```bash
+pip install certior
+```
+
+## Guard.verify() — explicit per-call verification
+
+`Guard.verify()` is the lowest-level surface. Call it wherever you currently dispatch a tool, inspect the `VerifyResult`, and branch on `result.allowed`. This is the right choice when your loop already has a single dispatch point, or when you need full access to the verification details (PII found, redacted parameters, the proof certificate) before deciding what to do.
+
+```python
+from certior import Guard, CertiorBlocked
+
+guard = Guard(
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    policy="hipaa",
+    agent_id="my-custom-agent",
+)
+```
+
+### Full parameter reference
+
+```python
+result = guard.verify(
+    tool="search_web",                             # tool/action name; used in the audit log
+    params={"query": "AI safety research"},        # tool parameters dict
+    content="search for AI safety research",       # text to scan for PII / safety violations
+    required_capabilities=["network:http:read"],   # capabilities this tool requires
+    cost_cents=2,                                  # budget to debit on success
+)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tool` | `str` | Tool or action name. Appears in the audit log and the proof certificate theorem. |
+| `params` | `dict` | Tool parameters. Values are scanned for PII; a redacted copy is available on the result. |
+| `content` | `str` | Explicit content string to run through the content gate (prompt, free-text argument, etc.). |
+| `required_capabilities` | `list[str]` | Capabilities the tool requires. Z3 proves these are a subset of the guard's permissions. |
+| `cost_cents` | `int` | Cost to debit from `budget_remaining` on an allowed call. |
+
+### Handling the result
+
+```python
+result = guard.verify(
+    tool="search_web",
+    params={"query": user_query},
+    content=user_query,
+    required_capabilities=["network:http:read"],
+    cost_cents=2,
+)
+
+if result.allowed:
+    # Use redacted_params to forward PII-scrubbed parameters to the tool
+    output = execute_tool("search_web", result.redacted_params or {"query": user_query})
+
+    # Archive the signed proof certificate
+    if result.certificate:
+        store_cert({
+            "id":          result.certificate.id,
+            "theorem":     result.certificate.theorem,
+            "plan_hash":   result.certificate.plan_hash,
+            "proof_trace": result.certificate.proof_trace,
+        })
+else:
+    # result.reason is a human-readable explanation of why the call was blocked
+    # result.violations is a list of Violation objects with category + detail
+    print(f"Blocked: {result.reason}")
+    for v in result.violations:
+        print(f"  [{v.category}] {v.detail}")
+    # result.pii_found is [(pii_type, matched_text), ...]
+    if result.pii_found:
+        print(f"PII detected: {result.pii_found}")
+```
+
+### VerifyResult fields
+
+| Field | Type | Description |
+|---|---|---|
+| `allowed` | `bool` | `True` if all three gates passed. |
+| `blocked` | `bool` | `not allowed` — convenience property. |
+| `reason` | `str` | Semicolon-joined explanation of all blocking violations. Empty on allow. |
+| `violations` | `list[Violation]` | Each violation has `.category`, `.detail`, `.severity` (`"block"` or `"warn"`). |
+| `redacted_content` | `str \| None` | PII-scrubbed version of the `content` argument. |
+| `redacted_params` | `dict \| None` | PII-scrubbed version of `params`. Forward this to the tool executor. |
+| `pii_found` | `list[tuple]` | `(pii_type, matched_text)` pairs for every PII span detected. |
+| `certificate` | `Certificate \| None` | Signed proof certificate on allow (when a Z3 verdict was issued). `None` on block or when no capability/cost was specified. |
+| `latency_ms` | `float` | Wall-clock time for the verify call. Typical: < 10 ms. |
+
+## Guard.wrap() — decorator pattern
+
+`Guard.wrap()` is a decorator factory that wraps a function so verification runs automatically before the function body executes. A blocked verdict raises `CertiorBlocked` instead of calling the function. This is the cleanest pattern when you own the tool definitions and want the verification wired in at definition time rather than at call sites.
+
+### Direct decorator (no arguments)
+
+```python
+@guard.wrap
+def fetch_document(path: str) -> str:
+    return open(path).read()
+```
+
+With no arguments, `guard.wrap` uses the function's `__name__` as the tool name and runs only the content and budget gates (no required capabilities, zero cost).
+
+### Decorator factory (with arguments)
+
+```python
+@guard.wrap(
+    tool_name="fetch_document",
+    required_capabilities=["filesystem:read"],
+    cost_cents=1,
+)
+def fetch_document(path: str) -> str:
+    return open(path).read()
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `tool_name` | `str` | `fn.__name__` | Name used in audit log and capability check. |
+| `required_capabilities` | `list[str]` | `None` | Capabilities the tool requires. |
+| `cost_cents` | `int` | `0` | Budget cost per call. |
+| `content_extractor` | `Callable` | `None` | Optional function that accepts the same args as the wrapped function and returns the string to scan. |
+
+### Catching CertiorBlocked
+
+```python
+from certior import CertiorBlocked
+
+try:
+    result = fetch_document(path="/etc/shadow")
+except CertiorBlocked as e:
+    print(f"Blocked: {e.result.reason}")
+    print(f"Violations: {[v.detail for v in e.result.violations]}")
+```
+
+### Async support
+
+`guard.wrap()` detects `asyncio.iscoroutinefunction` and produces an async wrapper automatically:
+
+```python
+@guard.wrap(
+    tool_name="async_web_fetch",
+    required_capabilities=["network:http:read"],
+    cost_cents=2,
+)
+async def async_web_fetch(url: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+# Calling await async_web_fetch(url) runs the async verify first, then the coroutine
+```
+
+## CertiorMiddleware — async-friendly loop pattern
+
+`CertiorMiddleware` sits between the LLM's tool-call decisions and your tool executor. It holds a per-tool spec registry so you declare capability and cost once and every call carries a proof automatically. Use this pattern when your loop dispatches through a single executor function.
+
+```python
+from certior import Guard
+from certior.adapters.tool_use import CertiorMiddleware
+
+guard = Guard(
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    policy="default",
+)
+
+mw = CertiorMiddleware(
+    guard=guard,
+    tool_specs={
+        "search_web": {"required_capabilities": ["network:http:read"], "cost_cents": 2},
+        "read_file":  {"required_capabilities": ["filesystem:read"],   "cost_cents": 1},
+    },
+)
+```
+
+You can also register tools incrementally after construction:
+
+```python
+mw.register_tool("draft_email", required_capabilities=["mail:draft"], cost_cents=5)
+```
+
+### Option A: wrap your executor
+
+```python
+safe_execute = mw.wrap_executor(my_tool_executor)
+# safe_execute has the same (tool_name, params, **kwargs) -> Any signature
+# Blocked calls return a string explanation and never invoke my_tool_executor
+
+result = safe_execute("search_web", {"query": "AI safety"})
+```
+
+Async executors are detected and wrapped with an async wrapper automatically:
+
+```python
+safe_execute = mw.wrap_executor(async_tool_executor)
+result = await safe_execute("search_web", {"query": "AI safety"})
+```
+
+### Option B: check then execute yourself
+
+```python
+decision = mw.check("search_web", {"query": "AI safety"})
+
+if decision.allowed:
+    store_cert(decision.certificate)
+    result = my_tool_executor("search_web", decision.redacted_params)
+else:
+    result = f"Blocked: {decision.reason}"
+```
+
+### Custom block handler
+
+Pass `on_block` to control what blocked calls return instead of the default message string:
+
+```python
+def handle_block(tool_name: str, params: dict, verdict) -> str:
+    log_to_siem(tool_name, params, verdict.reason)
+    return f'{{"error": "tool_blocked", "tool": "{tool_name}"}}'
+
+mw = CertiorMiddleware(guard=guard, tool_specs=tool_specs, on_block=handle_block)
+safe_execute = mw.wrap_executor(my_tool_executor)
+```
+
+## Multi-agent delegation pattern
+
+When you have a parent agent that spawns child agents, create a child `Guard` whose permissions are a **strict subset** of the parent's. This enforces the delegation safety property at the Python layer — a child agent cannot acquire capabilities the parent doesn't hold.
+
+```python
+from certior import Guard, CertiorBlocked
+
+# Parent agent: broad capabilities, large budget
+parent_guard = Guard(
+    permissions=["network:http:read", "filesystem:read", "mail:draft", "database:read"],
+    budget_cents=10_000,
+    policy="sox",
+    agent_id="orchestrator",
+)
+
+# Child agent: only the subset it actually needs, tighter budget
+research_child_guard = Guard(
+    permissions=["network:http:read"],   # subset of parent ✓
+    budget_cents=2_000,                  # child can't exceed parent's budget ceiling
+    policy="sox",
+    agent_id="research-subagent",
+)
+
+writing_child_guard = Guard(
+    permissions=["filesystem:read"],     # different subset ✓
+    budget_cents=1_000,
+    policy="sox",
+    agent_id="writing-subagent",
+)
+
+# At delegation time, verify the child's capability set is valid
+def delegate_to_child(child_guard: Guard, task: str, tool: str, params: dict):
+    # Verify the child holds only what the parent holds
+    excess = set(child_guard.permissions) - set(parent_guard.permissions)
+    if excess:
+        raise ValueError(
+            f"Child guard requests capabilities not held by parent: {sorted(excess)}"
+        )
+
+    # Verify the specific tool call in the child's scope
+    result = child_guard.verify(
+        tool=tool,
+        params=params,
+        content=task,
+        required_capabilities=child_guard.permissions,
+        cost_cents=1,
+    )
+    if result.blocked:
+        raise CertiorBlocked(result)
+    return result
+
+# Allowed — research subagent calling a tool within its permissions
+result = delegate_to_child(research_child_guard, "find papers", "search_web",
+                           {"query": "AI safety 2024"})
+print(f"Allowed: cert={result.certificate.id[:12]}…")
+
+# Blocked — research subagent trying to use a capability it doesn't hold
+try:
+    delegate_to_child(research_child_guard, "send report", "draft_email",
+                      {"to": "boss@example.com", "body": "..."})
+except CertiorBlocked as e:
+    print(f"Blocked: {e.result.reason}")
+```
+
+<Note>
+Certior's Lean-proven `delegationSafety` theorem establishes that if you enforce `child_caps ⊆ parent_caps` at every delegation boundary, the overall system's capability set can never grow beyond the root guard's permissions — regardless of how many agents are chained. The Python subset check above is the runtime application of that theorem.
+</Note>
+
+## Putting it together — a full custom loop
+
+```python
+import asyncio
+from certior import Guard, CertiorBlocked
+from certior.adapters.tool_use import CertiorMiddleware
+
+# ── Guard ──────────────────────────────────────────────────────────────
+guard = Guard(
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    policy="hipaa",
+    agent_id="my-custom-loop-agent",
+)
+
+# ── Middleware ─────────────────────────────────────────────────────────
+mw = CertiorMiddleware(
+    guard=guard,
+    tool_specs={
+        "web_search": {"required_capabilities": ["network:http:read"], "cost_cents": 2},
+        "read_file":  {"required_capabilities": ["filesystem:read"],   "cost_cents": 1},
+    },
+)
+
+# ── Tool implementations ───────────────────────────────────────────────
+async def my_executor(tool_name: str, params: dict) -> str:
+    if tool_name == "web_search":
+        return f"[results for {params.get('query')!r}]"
+    if tool_name == "read_file":
+        return f"[contents of {params.get('path')!r}]"
+    return f"[unknown: {tool_name}]"
+
+safe_executor = mw.wrap_executor(my_executor)
+
+# ── Agent loop ─────────────────────────────────────────────────────────
+async def agent_loop(llm_tool_calls: list) -> list:
+    results = []
+    for call in llm_tool_calls:
+        tool_name = call["name"]
+        params    = call["params"]
+
+        output = await safe_executor(tool_name, params)
+        results.append({"tool": tool_name, "output": output})
+
+    return results
+
+# ── Run ────────────────────────────────────────────────────────────────
+async def main():
+    calls = [
+        {"name": "web_search", "params": {"query": "MRSA treatment guidelines"}},
+        {"name": "read_file",  "params": {"path": "/docs/protocol.md"}},
+    ]
+
+    results = await agent_loop(calls)
+    for r in results:
+        print(f"{r['tool']}: {r['output']}")
+
+    print(f"\nBudget remaining: {guard.budget_remaining}¢")
+    print(f"Audit entries:    {len(guard.audit_log)}")
+
+asyncio.run(main())
+```
+
+## Inspecting the audit log
+
+Every `guard.verify()` call — whether direct, via `wrap()`, or via middleware — appends an entry to `guard.audit_log`:
+
+```python
+for entry in guard.audit_log:
+    print(entry)
+# {"tool": "web_search", "allowed": True,  "violations": 0, "pii_count": 0, "latency_ms": 3.2, "time": 1718000000.1}
+# {"tool": "read_file",  "allowed": False, "violations": 1, "pii_count": 0, "latency_ms": 2.8, "time": 1718000001.3}
+```
+
+<Tip>
+For long-running agents, drain `guard.audit_log` periodically to a durable store. The in-memory list is unbounded by default — for a high-throughput agent that runs thousands of calls per hour, the memory footprint grows proportionally.
+</Tip>

@@ -1,0 +1,210 @@
+---
+title: "Formally Verified Safety for OpenAI Tool-Calling Agents"
+sidebarTitle: "OpenAI"
+description: "Add verified capability, content, and budget gates to an OpenAI agent — every allowed call gets a signed receipt, every blocked call is formally proven."
+---
+
+Certior drops into an existing OpenAI tool-calling loop without replacing anything you already have. Your `client.chat.completions.create()` call stays as-is; you add one `verify_tool_calls()` call on the response and branch on the result. Every tool call that passes the three proof gates (capability, content, budget) receives a signed certificate bound to a Lean-audited policy fingerprint. Every call that fails is blocked with a precise reason before your executor ever runs.
+
+<Steps>
+
+### Install Certior
+
+```bash
+pip install certior
+```
+
+Certior pulls in Z3 and the Lean policy fingerprint metadata automatically. No Docker, no system packages, and no LLM API key is needed to verify that the integration works.
+
+### Define your guard and tool specs
+
+Create a `Guard` that captures what this agent is allowed to do. Each row in `CERTIOR_TOOL_SPECS` maps a tool name to the capabilities it requires and how much budget it consumes per call.
+
+```python
+from certior import Guard
+from certior.adapters.tool_use import verify_tool_calls
+
+guard = Guard(
+    permissions=["network:http:read", "filesystem:read", "mail:draft"],
+    budget_cents=5000,
+    policy="hipaa",          # "default" | "hipaa" | "sox" | "legal_privilege"
+    agent_id="research-assistant",
+)
+
+CERTIOR_TOOL_SPECS = {
+    "search_web":  {"required_capabilities": ["network:http:read"], "cost_cents": 2},
+    "read_file":   {"required_capabilities": ["filesystem:read"],   "cost_cents": 1},
+    "draft_email": {"required_capabilities": ["mail:draft"],        "cost_cents": 5},
+}
+```
+
+Add one row per tool. Any tool not in the spec is verified with no required capabilities and zero cost — the content and budget gates still run.
+
+### Call verify_tool_calls() on the response
+
+Find the spot in your loop that iterates over `response.choices[0].message.tool_calls` and replace it:
+
+<CodeGroup>
+
+```python Before
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    tools=tool_specs,
+)
+for call in response.choices[0].message.tool_calls:
+    result = execute_tool(call.function.name, json.loads(call.function.arguments))
+```
+
+```python After
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    tools=tool_specs,
+)
+
+verified = verify_tool_calls(
+    guard,
+    response.choices[0].message.tool_calls,   # OpenAI-native shape, no transform needed
+    tool_specs=CERTIOR_TOOL_SPECS,
+)
+
+for call in verified:
+    if call["allowed"]:
+        result = execute_tool(call["name"], call["input"])
+        archive_certificate(call["certificate"])    # persist for audit
+    else:
+        log_blocked(call["name"], call["reason"])   # executor never runs
+```
+
+</CodeGroup>
+
+`verify_tool_calls()` accepts the raw OpenAI SDK objects — it handles JSON-encoded `arguments` strings internally. You don't need to deserialise anything before passing the list.
+
+### Handle allowed and blocked results
+
+Each item in `verified` is a plain dict with a consistent shape:
+
+```python
+for call in verified:
+    name        = call["name"]           # tool name, normalised
+    params      = call["input"]          # deserialised arguments dict
+    allowed     = call["allowed"]        # bool
+    reason      = call["reason"]         # populated on block, "" on allow
+    certificate = call["certificate"]    # signed proof cert on allow, None on block
+    redacted    = call["redacted_input"] # PII-scrubbed params (use instead of input when forwarding)
+    pii_found   = call["pii_found"]      # [(pii_type, matched_text), ...]
+
+    if allowed:
+        result = execute_tool(name, redacted)   # prefer redacted_input
+    else:
+        result = f"I can't do that: {reason}"  # surface to the LLM as a tool error
+```
+
+<Tip>
+Pass `redacted_input` to your executor instead of `input` — under `policy="hipaa"` or `policy="sox"`, Certior has already removed any PII or MNPI it found, so the downstream tool sees clean data automatically.
+</Tip>
+
+### Archive the certificate
+
+The certificate on each allowed call is a signed JSON object you can persist, ship in a compliance pack, or verify offline. It carries the Lean policy fingerprint, the Z3 proof trace, and a tamper-detecting signature.
+
+```python
+import json
+
+def archive_certificate(cert) -> None:
+    if cert is None:
+        return
+    record = {
+        "id":          cert.id,
+        "theorem":     cert.theorem,        # e.g. "action_admissible:search_web"
+        "plan_hash":   cert.plan_hash,      # sha256 of the action + policy fingerprint
+        "proof_trace": cert.proof_trace,    # "Z3 SAT in 4.2ms, policy: Lean-audited @ 4542ff75cfe3aec7"
+        "prover":      cert.prover,         # "z3"
+    }
+    with open("audit_log.jsonl", "a") as f:
+        f.write(json.dumps(record) + "\n")
+```
+
+You can inspect the policy provenance that every certificate ties back to:
+
+```python
+print(guard.policy_attestation)
+# {
+#   'kernel':    'Certior.Lattice + Delegation + Encoding + Composition (Lean 4)',
+#   'fingerprint': '4542ff75cfe3aec7',
+#   'audited_guarantees': [
+#       'Certior.Delegation.delegationSafety',
+#       'Certior.Encoding.ifcSoundness',
+#       'Certior.Composition.compositionSoundness',
+#       'SecurityLevel.isValidBoundedLattice',
+#   ],
+#   'trusted_axioms': ['propext', 'Classical.choice', 'Quot.sound'],
+#   'audit_command': 'cd lean4/CertiorLattice && lake build Certior.Audit',
+# }
+```
+
+</Steps>
+
+## What the three gates catch
+
+<CardGroup cols={3}>
+  <Card title="Capability gate" icon="shield-check">
+    Z3 proves `required_capabilities ⊆ permissions` on every call. A jailbreak that asks an agent to run `db_admin_drop` when it only holds `network:http:read` is formally blocked — no certificate is issued.
+  </Card>
+  <Card title="Content gate" icon="eye">
+    The content scanner runs on the prompt and all string parameters. Under `policy="hipaa"` it detects and redacts PHI (SSNs, MRNs, dates of birth). Under `policy="sox"` it detects MNPI. A blocked content verdict prevents the executor from receiving the payload at all.
+  </Card>
+  <Card title="Budget gate" icon="coin">
+    Each call debits `cost_cents` from `budget_cents`. Once the budget hits zero every subsequent call is blocked with `budget_exceeded: need N, have M`. The budget is a hard ceiling, not a soft warning.
+  </Card>
+</CardGroup>
+
+## Choosing a policy
+
+| Policy | What it adds | Use for |
+|---|---|---|
+| `"default"` | Capability + budget gates only | Most agents |
+| `"hipaa"` | + PHI detection, redaction, 6-year audit retention | Healthcare, patient data |
+| `"sox"` | + MNPI detection, 7-year retention, segregation of duties | Finance, M&A workflows |
+| `"legal_privilege"` | + Attorney-client privilege detection | Legal review, contract drafting |
+
+## Using CertiorMiddleware for a cleaner loop
+
+If you prefer to keep the verification logic out of your dispatch loop entirely, `CertiorMiddleware` wraps your executor and handles the allow/block logic for you:
+
+```python
+from certior.adapters.tool_use import CertiorMiddleware
+
+mw = CertiorMiddleware(guard=guard, tool_specs=CERTIOR_TOOL_SPECS)
+safe_execute = mw.wrap_executor(execute_tool)
+
+# safe_execute has the same signature as execute_tool but
+# runs the three gates first. Blocked calls return a string
+# explanation and never invoke execute_tool.
+for call in response.choices[0].message.tool_calls:
+    name   = call.function.name
+    params = json.loads(call.function.arguments)
+    result = safe_execute(name, params)
+```
+
+You can also register tools incrementally on the middleware:
+
+```python
+mw.register_tool("search_web", required_capabilities=["network:http:read"], cost_cents=2)
+mw.register_tool("read_file",  required_capabilities=["filesystem:read"],   cost_cents=1)
+```
+
+## Verifying the integration without a live OpenAI key
+
+Run the bundled demo — the tool-call objects are byte-exact to what the OpenAI SDK returns, so the entire verification path is exercised without any API call:
+
+```bash
+python examples/openai_agent_demo.py
+```
+
+You should see four scenarios: a legitimate path that issues signed certs, a jailbreak blocked by the capability gate, a PII-carrying payload blocked by the content gate, and a burst of calls that exhausts the budget.
+
+<Note>
+Certior verifies **what the agent is allowed to do**, not what the LLM decides to do. The LLM still chooses which tools to call — Certior enforces the boundary around those calls. A prompt that says "don't drop tables" is not a security boundary. A formally proven capability gate is.
+</Note>

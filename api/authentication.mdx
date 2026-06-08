@@ -1,0 +1,188 @@
+---
+title: "Certior API Authentication — Keys, Headers & Roles"
+sidebarTitle: "Authentication"
+description: "Certior authenticates every request with an API key. Learn how to register, pass, rotate, and scope keys using roles and the auth endpoints."
+---
+
+Every Certior API endpoint except `GET /api/v1/compliance/presets` and `GET /health` requires a valid API key. You obtain a key by calling `POST /api/v1/auth/register` once, store it securely, and include it in every subsequent request. Keys are prefixed with `ck-` so you can identify them unambiguously in secrets managers and log scrubbers.
+
+## Passing Your API Key
+
+Certior accepts the key through any one of three mechanisms, checked in priority order:
+
+<Tabs>
+  <Tab title="Authorization Header (recommended)">
+    ```http
+    Authorization: Bearer ck-your-api-key-here
+    ```
+  </Tab>
+  <Tab title="X-API-Key Header">
+    ```http
+    X-API-Key: ck-your-api-key-here
+    ```
+  </Tab>
+  <Tab title="Query Parameter">
+    ```
+    GET /api/v1/auth/me?api_key=ck-your-api-key-here
+    ```
+    Use this only when you cannot set custom headers (e.g., WebSocket upgrades).
+  </Tab>
+</Tabs>
+
+<Note>
+The `Authorization: Bearer` header is the preferred mechanism. The `X-API-Key` header and query parameter exist for compatibility with tools and WebSocket clients that cannot set arbitrary headers.
+</Note>
+
+## Registering a User
+
+`POST /api/v1/auth/register` creates a new user account and returns the API key **one time only**. Store it immediately in a secrets manager — you cannot retrieve it again. To recover access after losing a key, call `POST /api/v1/auth/rotate`.
+
+### Request body
+
+<ParamField body="email" type="string" required>
+  The user's email address or identifier. Must be unique across all registered users. Minimum 3 characters.
+</ParamField>
+
+<ParamField body="name" type="string">
+  Display name. Defaults to the email value when omitted.
+</ParamField>
+
+<ParamField body="password" type="string">
+  Optional password for email/password sign-in via `POST /api/v1/auth/login`. Minimum 8 characters. When omitted, the user can only authenticate with the API key.
+</ParamField>
+
+<ParamField body="organization" type="string">
+  Optional organization name stored in the user's metadata.
+</ParamField>
+
+<ParamField body="role" type="string" default="operator">
+  Role assigned to the user. Accepted values: `admin`, `operator`, `viewer`, `auditor`, `approver`, `policy_author`. Roles control which endpoints and actions the user may access.
+</ParamField>
+
+### Response fields
+
+<ResponseField name="id" type="string">
+  The user's unique UUID.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The registered email address.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  The display name.
+</ResponseField>
+
+<ResponseField name="role" type="string">
+  The assigned role value.
+</ResponseField>
+
+<ResponseField name="api_key" type="string">
+  The plaintext API key, prefixed with `ck-`. **Shown once — store it now.**
+</ResponseField>
+
+<CodeGroup>
+```bash Register
+curl -X POST https://<host>/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "name": "Alice",
+    "password": "s3cr3tpassword",
+    "role": "operator"
+  }'
+```
+
+```json Response
+{
+  "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "role": "operator",
+  "api_key": "ck-KpZ8v2XqNw..."
+}
+```
+</CodeGroup>
+
+## Authenticated Request Example
+
+Once you have a key, include it in the `Authorization` header on every request:
+
+```bash
+curl https://<host>/api/v1/auth/me \
+  -H "Authorization: Bearer ck-KpZ8v2XqNw..."
+```
+
+## Inspecting Your Identity
+
+`GET /api/v1/auth/me` returns your profile without exposing the key itself:
+
+```json
+{
+  "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "role": "operator",
+  "created_at": 1718000000.0,
+  "is_active": true
+}
+```
+
+## Rotating a Key
+
+`POST /api/v1/auth/rotate` immediately invalidates the current key and returns a new one. The new key is shown only once.
+
+```bash
+curl -X POST https://<host>/api/v1/auth/rotate \
+  -H "Authorization: Bearer ck-KpZ8v2XqNw..."
+```
+
+```json
+{
+  "api_key": "ck-newKeyValue..."
+}
+```
+
+## Email / Password Login
+
+If you registered with a password, `POST /api/v1/auth/login` authenticates and rotates your key in a single call:
+
+<ParamField body="email" type="string" required>
+  The registered email address.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  The account password. Minimum 8 characters.
+</ParamField>
+
+```bash
+curl -X POST https://<host>/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice@example.com", "password": "s3cr3tpassword"}'
+```
+
+## Roles and Access Control
+
+Certior enforces role-based access on top of API key authentication. The table below summarises what each role may do:
+
+| Role | Create tasks & workflows | Read executions | Compliance export | Release decisions | Promote releases |
+|------|--------------------------|-----------------|-------------------|------------------|-----------------| 
+| `admin` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `operator` | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `approver` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `auditor` | ❌ | ✅ | ✅ | ✅ | ❌ |
+| `policy_author` | ❌ | ✅ | ✅ | ✅ | ❌ |
+| `viewer` | ❌ | ✅ | ✅ | ✅ | ❌ |
+
+<Note>
+Users with the `viewer` role cannot create tasks or workflows but can read executions, export compliance packages, and view release decisions. Only `admin` and `approver` roles may record promotion decisions.
+</Note>
+
+## Error Responses
+
+| Scenario | Status | `detail` |
+|----------|--------|---------|
+| No key supplied | `401` | `"Missing API key. Supply via Authorization: Bearer <key> or X-API-Key header."` |
+| Key not recognised | `401` | `"Invalid API key."` |
+| Account deactivated | `403` | `"Account deactivated."` |
+| Insufficient role | `403` | `"Requires one of: ['admin', 'approver']"` |

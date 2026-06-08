@@ -1,0 +1,82 @@
+---
+title: "Certior Studio: Interactive Verification UI"
+sidebarTitle: "Studio"
+description: "Inspect runs, explore the delegation graph, and export audit packages through Certior Studio — the optional web UI for the Certior backend."
+---
+
+Certior Studio is a Next.js web interface that gives you a visual, interactive window into everything the Certior backend verifies. From Studio you can submit tasks, watch verification stages resolve in real time over a WebSocket connection, step through individual stage evidence, and export a complete audit package when a run finishes. The SDK works fully without Studio — it is an optional layer on top of the same API your code already calls.
+
+## Accessing Studio
+
+Studio is served on port `3001`. After starting the Certior backend, open your browser to:
+
+```
+http://localhost:3001
+```
+
+<Note>
+  Studio requires the Certior backend server to be running. Install the API extras with `pip install "certior[api]"` before starting the server.
+</Note>
+
+## What you can do in Studio
+
+<CardGroup cols={2}>
+  <Card title="Submit runs" icon="play">
+    Enter a task description and submit it directly from the Studio UI. Studio sends the request to the backend and immediately begins streaming the execution over WebSocket so you see each verification stage as it resolves.
+  </Card>
+  <Card title="Inspect stage evidence" icon="magnifying-glass">
+    Drill into any completed stage to review its evidence: capability token, Z3 verdict, Lean certificate (when the flow-check binary is configured), content scan result, and budget ledger entry.
+  </Card>
+  <Card title="View the delegation graph" icon="diagram-project">
+    The verification graph view renders the directed evidence graph for a run — each node is a proof claim, each edge links it to the code commit and runtime state that produced it. Use this to trace exactly how a release decision was reached.
+  </Card>
+  <Card title="Export audit packages" icon="file-export">
+    When a run completes, export the full audit package from Studio. The exported package is equivalent to calling `GET /api/v1/compliance/{id}/export` directly and includes all proof evidence, policy attestations, and runtime metadata.
+  </Card>
+</CardGroup>
+
+## The Glass Box view
+
+Studio's Glass Box is the primary view for understanding multi-agent delegation chains. It shows the live capability boundary for each agent in a run: which permissions the agent holds, which tool calls it has attempted, and — when a violation occurs — exactly where in the delegation chain the capability boundary was breached.
+
+<Steps>
+  <Step title="Open a run in the Glass Box">
+    Select any active or completed execution from the runs list. Studio loads the delegation graph in the centre panel, with plan-control, reviewer, and evaluation panels on either side.
+  </Step>
+  <Step title="Identify boundary violations">
+    Blocked calls are highlighted in the delegation graph with a precise reason — for example, `capability_not_in_parent: database:admin`. The agent that triggered the block and the parent whose boundary it exceeded are both identified.
+  </Step>
+  <Step title="Step through the evidence">
+    Click any node in the graph to open its evidence panel. For blocked calls, the panel shows the Z3 counter-example that proved the capability escalation. For allowed calls, it shows the signed certificate.
+  </Step>
+</Steps>
+
+<Tip>
+  The Glass Box view is particularly useful during development: submit a task with a narrow permission set, then use the graph to see exactly which tool calls succeed, which are blocked, and why — without reading log files.
+</Tip>
+
+## How Studio connects to the backend
+
+Studio streams execution state over a WebSocket connection. When you submit a run, Studio opens a `WS /ws/executions/{id}` connection and receives stage events as they are emitted by the backend worker. The HTTP API (`GET /api/v1/executions/{id}`) provides the complete state for a finished run; WebSocket streaming keeps the UI live during execution.
+
+The backend URL Studio connects to is configured through two environment variables set in the Studio frontend process:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | *(blank — uses Next.js rewrites locally)* | Backend API base URL for Studio HTTP requests |
+| `NEXT_PUBLIC_WS_URL` | *(blank — derived from API URL or `localhost:8000`)* | WebSocket base URL for execution streaming |
+
+In local development these variables can be left blank; Next.js rewrites handle routing automatically. In a deployed environment, set both variables explicitly so Studio reaches the correct backend.
+
+## Studio is optional
+
+The Certior SDK (`pip install certior`) works entirely without Studio. `Guard.verify()`, `Guard.wrap()`, and the compliance export API are all available through Python and the REST API. Studio adds a graphical layer for interactive exploration and audit review — it does not change what the backend verifies or how certificates are issued.
+
+<CardGroup cols={2}>
+  <Card title="Without Studio" icon="terminal">
+    Use `Guard.verify()` or `Guard.wrap()` in your code. Query `GET /api/v1/executions/{id}` and `GET /api/v1/compliance/{id}/export` directly. Full verification, signing, and evidence export work exactly the same way.
+  </Card>
+  <Card title="With Studio" icon="display">
+    All the same guarantees, plus a visual delegation graph, real-time stage streaming, and a point-and-click export flow. Useful for demos, audit reviews, and debugging multi-agent chains.
+  </Card>
+</CardGroup>

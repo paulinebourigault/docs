@@ -1,0 +1,150 @@
+---
+title: "Certior Configuration Reference"
+sidebarTitle: "Configuration"
+description: "Guard constructor parameters, the verification stack, and the one environment variable you set to enable live Lean flow checking."
+---
+
+Certior is designed to work with zero mandatory configuration — sensible defaults let you drop a `Guard` into any agent framework and immediately get verified safety checks. This page documents every parameter you control directly: the `Guard` constructor arguments that shape each guard's policy and behaviour, the verification stack that backs those checks, and the single environment variable (`CERTIOR_FLOW_CHECK_BINARY`) that enables live Lean flow verification.
+
+## Guard constructor parameters
+
+Instantiate `Guard` from the `certior` package. All parameters are optional:
+
+```python
+from certior import Guard
+
+guard = Guard(
+    policy="hipaa",
+    permissions=["network:http:read", "filesystem:read"],
+    budget_cents=5000,
+    auto_redact=True,
+    agent_id="my-research-agent",
+)
+```
+
+<ParamField body="policy" type="str | Policy" default="Policy.DEFAULT">
+  The compliance policy this guard enforces. Accepts a `Policy` enum value or an equivalent string. Each policy activates a matching set of content detectors and compliance rules.
+
+  | Value | String alias | What it enforces |
+  |---|---|---|
+  | `Policy.DEFAULT` | `"default"` | Base capability and content checks |
+  | `Policy.HIPAA` | `"hipaa"` | HIPAA isolation — blocks PHI in prompts and outputs |
+  | `Policy.SOX` | `"sox"` | SOX non-repudiation — enforces audit trail requirements |
+  | `Policy.LEGAL` / `Policy.LEGAL_PRIVILEGE` | `"legal"` / `"legal_privilege"` | Attorney-client privilege content rules |
+</ParamField>
+
+<ParamField body="permissions" type="list[str]" default='["*"]'>
+  The capability strings this guard authorises. Every tool call verified by this guard must declare only capabilities that appear in this list. Pass `["*"]` to allow all capabilities (wildcard — Z3 capability checking is skipped). Pass an explicit list to enforce strict capability containment.
+
+  Example values: `["network:http:read"]`, `["filesystem:read", "filesystem:write"]`, `["database:read"]`.
+</ParamField>
+
+<ParamField body="budget_cents" type="int" default="10000">
+  Maximum total cost budget for this guard, in US cents (so `10000` = $100.00). Each `verify()` call that passes a `cost_cents` argument debits from this balance. When the remaining balance would fall below zero, the call is blocked with a `budget` violation. The guard tracks `budget_remaining` as a read-only property.
+</ParamField>
+
+<ParamField body="on_violation" type="Callable[[VerifyResult], None] | None" default="None">
+  An optional callback invoked whenever `verify()` blocks a call. The callback receives the full `VerifyResult` — including the list of `Violation` objects, the redacted content, and the latency. Use this for custom logging, alerting, or escalation logic. Exceptions raised inside the callback are caught and logged; they do not propagate.
+</ParamField>
+
+<ParamField body="auto_redact" type="bool" default="True">
+  When `True`, the guard automatically replaces detected PII in the `content` string and in `params` dict values with redacted placeholders. The original content is never stored. The redacted versions are available as `VerifyResult.redacted_content` and `VerifyResult.redacted_params`. Set to `False` if your pipeline handles redaction separately and you only want the PII detection metadata.
+</ParamField>
+
+<ParamField body="agent_id" type="str" default='"default-agent"'>
+  A stable identifier for the agent this guard protects. The `agent_id` is embedded in every signed proof certificate issued by this guard. Use a consistent, human-readable value — for example `"search-agent"` or `"billing-reviewer"` — so certificates in your audit log are traceable back to a specific agent.
+</ParamField>
+
+## Verification stack
+
+Three formal verification layers back every guard. You do not configure Z3 or Dafny directly — they are part of the runtime. The table below explains what each layer does from your perspective:
+
+| Layer | Always on? | Customer configuration | What it contributes |
+|---|---|---|---|
+| **Z3** | ✅ Yes | None — built into the runtime | Pre-execution SMT verification of capability coverage, budget constraints, and policy constraints. Issues signed proof certificates for allowed calls. |
+| **Lean 4** | Optional | Set `CERTIOR_FLOW_CHECK_BINARY` | Live per-plan flow checking against the `Certior.Delegation` lattice. Adds a Lean certificate to `VerifyResult.certificate` alongside the Z3 certificate. |
+| **Dafny** | ✅ Yes | None — built into runtime modules | Verified bridges for certificate issuance, capability attenuation, path safety, and seccomp-backed runtime evidence. Surfaces in exported compliance packages. |
+
+Z3 is the always-on verification layer. Every `Guard.verify()` call goes through the Z3 gate for capability, budget, and content checks. Lean adds a second proof layer when the flow-check binary is present. Dafny-backed guarantees are embedded in specific runtime modules and appear in exported evidence — they do not require a separate configuration step.
+
+## CERTIOR_FLOW_CHECK_BINARY
+
+The one environment variable you set to unlock live Lean flow verification:
+
+```bash
+export CERTIOR_FLOW_CHECK_BINARY="/path/to/certior-flow-check"
+```
+
+When this variable points to a valid `certior-flow-check` binary, the runtime routes every plan through the Lean verifier in addition to the Z3 gate. Allowed plans receive both a Z3 certificate and a Lean certificate in `VerifyResult.certificate`. Without the binary, the runtime falls back to a Python subset check and issues only the Z3 certificate.
+
+The runtime also auto-discovers the binary in two fallback locations (in priority order after the environment variable):
+
+1. The default Lake build output: `lean4/CertiorPlan/.lake/build/bin/certior-flow-check` relative to the installed package
+2. `certior-flow-check` on the system `PATH`
+
+If none of these resolve, the runtime logs a one-time warning at startup and continues with Z3-only verification.
+
+<Note>
+  Building `certior-flow-check` requires the Lean toolchain. See the [Lean Binary](/reference/lean-binary) reference for build instructions and performance notes.
+</Note>
+
+## Usage examples
+
+<CodeGroup>
+  ```python Minimal — all capabilities allowed
+  from certior import Guard
+
+  # Wildcard permissions: Z3 skips capability check, budget still enforced
+  guard = Guard()
+  result = guard.verify(tool="web_search", content="Find recent AI papers")
+  ```
+
+  ```python HIPAA — strict capability and content checking
+  from certior import Guard
+
+  guard = Guard(
+      policy="hipaa",
+      permissions=["network:http:read"],
+      budget_cents=2000,
+      auto_redact=True,
+      agent_id="patient-lookup-agent",
+  )
+  result = guard.verify(
+      tool="db_query",
+      content="Patient SSN: 123-45-6789",
+      required_capabilities=["network:http:read"],
+      cost_cents=10,
+  )
+  # result.redacted_content has SSN replaced
+  # result.certificate holds the Z3 proof if allowed
+  ```
+
+  ```python With violation callback
+  from certior import Guard, VerifyResult
+  import logging
+
+  def alert_on_block(result: VerifyResult):
+      logging.warning("Blocked: %s", result.reason)
+
+  guard = Guard(
+      policy="sox",
+      permissions=["filesystem:read"],
+      on_violation=alert_on_block,
+  )
+  ```
+
+  ```python Decorator pattern
+  from certior import Guard, CertiorBlocked
+
+  guard = Guard(permissions=["network:http:read"])
+
+  @guard.wrap(required_capabilities=["network:http:read"], cost_cents=5)
+  def fetch_url(url: str) -> str:
+      ...  # only runs if guard allows it
+
+  try:
+      result = fetch_url("https://example.com")
+  except CertiorBlocked as e:
+      print(e.result.reason)
+  ```
+</CodeGroup>
